@@ -5,6 +5,7 @@
 - 觉得项目写的好的兄弟们，留下一个star作为鼓励~
 - 告诉兄弟们一个好消息~ EasyTshark社区今天终于出来啦！
 - ![朋友圈截图](images/X.jpg)
+- 下载官网：https://www.easytshark.com/
 
 ## 功能特点
 
