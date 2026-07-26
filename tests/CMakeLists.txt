@@ -24,6 +24,12 @@ execute_process(
 )
 
 # 添加GoogleTest作为子目录
+# MSVC：googletest 默认用静态 CRT(/MT)，而本工程用动态 CRT(/MD)，两者混链会触发
+# LNK2038(RuntimeLibrary 不匹配)。强制 googletest 也用动态 CRT 以对齐。该变量仅 MSVC
+# 生效，POSIX(Linux/macOS)无 CRT 之分，行为不变。
+if(MSVC)
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+endif()
 add_subdirectory(
     ${GOOGLETEST_ROOT}
     ${CMAKE_CURRENT_BINARY_DIR}/googletest-build
@@ -47,11 +53,23 @@ target_link_libraries(unit_tests
     gmock
     gmock_main
     tshark_lib
-    pthread
 )
-# libdl 仅 Linux 需要（macOS 的 dlopen 在 libSystem 内，无独立 libdl）
-if(NOT APPLE)
-    target_link_libraries(unit_tests dl)
+
+# 平台相关链接（与顶层 CMakeLists.txt 保持一致）：
+#   - macOS: pthread（dlopen 在 libSystem 内，无独立 libdl）
+#   - Linux: pthread + dl
+#   - Windows: 无 pthread/dl（std::thread 走 CRT）；套接字用 ws2_32，随 tshark_lib 传递
+if(APPLE)
+    target_link_libraries(unit_tests pthread)
+elseif(WIN32)
+    # Windows 下无需 pthread/dl；ws2_32 已由 tshark_lib 传递链接
+else()
+    target_link_libraries(unit_tests pthread dl)
+endif()
+
+# 中文注释源码：MSVC 需 /utf-8，否则按 GBK/936 解析报 C4819/C2xxx（与顶层一致）
+if(MSVC)
+    target_compile_options(unit_tests PRIVATE /utf-8)
 endif()
 
 # 添加测试

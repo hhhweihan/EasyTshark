@@ -1,6 +1,6 @@
 # EasyTshark - 网络数据包捕获与分析工具
 
-本仓库是 EasyTshark 的 **C++ 学习实现版本**，从零用 C++11 重写核心抓包与分析逻辑，供学习网络编程、进程管理、SQLite 集成参考。社区成品版由原作者维护，见 [easytshark.com](https://www.easytshark.com/)。
+本仓库是 EasyTshark 的 **C++ 学习版本**，从零用 C++11 重写核心抓包与分析逻辑，供学习网络编程、进程管理、SQLite 集成参考。社区成品版由原作者维护，见 [easytshark.com](https://www.easytshark.com/)。
 
 EasyTshark 是一个基于 tshark 的网络数据包分析工具，提供实时抓包和离线分析功能，支持数据包的 SQLite 存储和 XML/JSON 格式转换，并提供**命令行**与**原生图形界面**两种前端。
 
@@ -25,13 +25,17 @@ EasyTshark 是一个基于 tshark 的网络数据包分析工具，提供实时�
 - **IP 地理位置**：
   - 基于 ip2region 自动解析数据包中 IP 地址的归属地
 
+- **tshark 自动探测**：
+  - 启动时自动定位 tshark：环境变量 `EASYTSHARK_TSHARK`、`PATH`、Windows 注册表与常见安装目录
+  - 也可通过上述环境变量或 GUI 输入框手动指定路径（无需重新编译）；未找到时给出 Wireshark 下载引导
+
 ### 查询功能
 - 支持 MAC 地址、IP 地址、端口、归属地四类条件查询（均支持模糊匹配）
 - 支持将查询结果保存为 JSON 文件
 
 ## 架构说明
 
-程序以 **`AnalysisSession`（门面）** 为唯一入口，对上服务 CLI / GUI 两种前端，对下装配并协调各职责单一的模块：`LiveCapture` 负责实时抓包、`PcapAnalyzer` 负责离线解析、`PacketParser` 把 tshark 的 fields 文本行解析成 `Packet`、`PcapFileReader` 按偏移随机读原始字节、`PdmlToJsonConverter` 做 PDML→JSON、`FlowMonitor` 做网卡流量趋势监控；`tsharkCommand` 收敛底层 tshark 交互（默认路径 / 参数构造 / 网卡枚举），`utils` 提供数据库、IP 归属地、编码等通用能力，`ProcessUtil` 封装子进程的创建与回收，`EventPoller` 抽象 I/O 多路复用（当前为 `poll` 实现，替代早期的 epoll，以支持跨平台）。整体数据流如下：
+程序以 **`AnalysisSession`（门面）** 为唯一入口，对上服务 CLI / GUI 两种前端，对下装配并协调各职责单一的模块：`LiveCapture` 负责实时抓包、`PcapAnalyzer` 负责离线解析、`PacketParser` 把 tshark 的 fields 文本行解析成 `Packet`、`PcapFileReader` 按偏移随机读原始字节、`PdmlToJsonConverter` 做 PDML→JSON、`FlowMonitor` 做网卡流量趋势监控；`tsharkCommand` 收敛底层 tshark 交互（路径解析 / 参数构造 / 网卡枚举），`utils` 提供数据库、IP 归属地、编码等通用能力，`ProcessUtil` 封装子进程的创建与回收，`EventPoller` 抽象 I/O 多路复用（POSIX 用 `poll`，Windows 用 `PeekNamedPipe` 轮询）。整体数据流如下：
 
 ```mermaid
 flowchart LR
@@ -66,19 +70,19 @@ flowchart LR
 | `FlowMonitor` | 各网卡流量趋势监控（`EventPoller` 多路复用） |
 | `PcapFileReader` | 按偏移随机读取 PCAP 原始字节（POSIX `mmap` / `ifstream` 回退） |
 | `PdmlToJsonConverter` | 将 tshark 的 PDML(XML) 转换为 JSON |
-| `TsharkCommand` | tshark 平台默认路径、命令参数构造、网卡枚举 |
+| `TsharkCommand` | tshark 路径解析（自动探测 / 环境变量 / 手动指定）、命令参数构造、网卡枚举 |
 | `SQLiteUtil` | 数据包入库、参数化查询、结果导出 JSON |
 | `IP2RegionUtil` | 根据 IP 解析地理位置（xdb 用 `call_once` 仅初始化一次） |
 | `CommonUtil` | 时间戳、字段名翻译等通用工具 |
 | `ProcessUtil` | 安全地创建、等待、终止 tshark 子进程 |
-| `EventPoller` | I/O 多路复用抽象（当前 `poll` 实现，替代 epoll，跨平台） |
+| `EventPoller` | I/O 多路复用抽象（POSIX `poll` / Windows `PeekNamedPipe` 轮询） |
 
 ## 系统要求
 
-- **操作系统**：
-  - **macOS**：已支持并验证（实时抓包 / 监控经 `EventPoller` 的 `poll` 实现，tshark 由 Wireshark.app 提供）。
-  - **Linux**：代码层面已抽象为可移植的 `poll`，理论支持，**尚待再次实测验证**。
-  - **Windows**：暂未支持（`CMakeLists.txt` 中为占位；进度见 `docs/REFACTOR_ROADMAP.md` 主题 1）。
+- **操作系统**（所有平台差异均以 `#if defined(_WIN32)` / `#else` 隔离，POSIX 路径行为不变）：
+  - **macOS**：已支持并验证（抓包 / 监控经 `EventPoller` 的 `poll` 实现，tshark 由 Wireshark.app 提供）。
+  - **Windows**：已支持（MSVC 原生编译；进程与管道走 `CreateProcessA` / `CreatePipe`，多路复用走 `PeekNamedPipe` 轮询，tshark 路径自动探测含注册表）。详见 [docs/BUILD_WINDOWS.md](docs/BUILD_WINDOWS.md)。
+  - **Linux**：与 macOS 共用可移植的 `poll` 实现，理论支持，**尚待再次实测验证**。
 - tshark（Wireshark 命令行工具）
 - SQLite3
 - C++11 兼容的编译器
@@ -86,14 +90,14 @@ flowchart LR
 
 ## 依赖库
 
-以下库均以 vendored 源码形式随仓库提供（放在 `include/<名字>/`），首次 clone 后即可离线构建：
+以下库均以 vendored 源码形式随仓库提供（放在 `third_party/<名字>/`），首次 clone 后即可离线构建：
 
 - **sqlite3**：数据存储（macOS / Linux 使用系统库）
-- **loguru**：日志记录（`include/loguru/`）
+- **loguru**：日志记录（`third_party/loguru/`）
 - **rapidjson**：JSON 处理
 - **rapidxml**：XML 处理
 - **ip2region**：IP 地理位置解析
-- **Dear ImGui + GLFW + OpenGL3**：图形界面（`include/imgui/`、`include/glfw/`；若这两个目录未就位，CMake 会自动跳过 `tshark_gui` 目标，CLI 与测试仍可独立构建）
+- **Dear ImGui + GLFW + OpenGL3**：图形界面（`third_party/imgui/`、`third_party/glfw/`；若这两个目录未就位，CMake 会自动跳过 `tshark_gui` 目标，CLI 与测试仍可独立构建）
 
 ## 安装
 
@@ -113,6 +117,10 @@ brew install cmake              # 若尚未安装
 sudo apt-get update
 sudo apt-get install -y build-essential cmake tshark libsqlite3-dev
 ```
+
+**Windows（MSVC）**：安装 [Wireshark](https://www.wireshark.org/)（提供 `tshark.exe`）与
+VS 2022 Build Tools（含 C++ 工作负载，自带 CMake / Ninja）。sqlite3 已 vendored，无需另装。
+详见 [docs/BUILD_WINDOWS.md](docs/BUILD_WINDOWS.md)。
 
 ### 2. 克隆仓库
 
@@ -156,6 +164,10 @@ cmake --build build
 ```
 
 构建产物输出到 `output/` 目录：`tshark_main`（CLI）、`tshark_gui`（GUI，依赖就位时）、`unit_tests`（测试）。
+
+**Windows（MSVC）**：在普通 `cmd` 中运行 `scripts\build_windows.bat`（勿用 Git Bash），
+产物为 `output\tshark_main.exe` / `output\tshark_gui.exe`。完整步骤见
+[docs/BUILD_WINDOWS.md](docs/BUILD_WINDOWS.md)。
 
 ## 使用方法
 
@@ -238,7 +250,7 @@ cmake --build build
 ├── run.sh                      # 构建和测试脚本
 ├── .clang-format               # 代码格式化规范
 ├── LICENSE                     # MIT 许可证
-├── include/                    # 头文件 + vendored 第三方库
+├── include/                    # 第一方头文件（仅项目自身）
 │   ├── AnalysisSession.hpp     # 门面
 │   ├── PacketParser.hpp        # fields 行解析
 │   ├── PcapAnalyzer.hpp        # 离线分析
@@ -250,10 +262,13 @@ cmake --build build
 │   ├── tsharkDataType.hpp      # 数据类型定义
 │   ├── processUtil.hpp         # 子进程操作工具
 │   ├── utils.hpp               # SQLite / IP 归属地 / 通用工具
-│   ├── platform/EventPoller.hpp# I/O 多路复用抽象
-│   ├── loguru/ imgui/ glfw/    # vendored 第三方库
-│   ├── rapidjson/ rapidxml/    # vendored 第三方库
-│   └── ip2region/              # vendored 第三方库
+│   └── platform/EventPoller.hpp# I/O 多路复用抽象
+├── third_party/                # vendored 第三方库（与第一方代码物理隔离）
+│   ├── loguru/                 # 日志
+│   ├── imgui/ glfw/            # 图形界面（Dear ImGui + GLFW）
+│   ├── rapidjson/ rapidxml/    # JSON / XML 处理
+│   ├── ip2region/              # IP 地理位置解析
+│   └── sqlite3/                # SQLite amalgamation（Windows 内置编译）
 ├── src/                        # 源文件目录
 │   ├── main.cpp                # CLI 主程序入口
 │   ├── AnalysisSession.cpp

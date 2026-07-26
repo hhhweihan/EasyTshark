@@ -10,6 +10,10 @@
 #include "tsharkCommand.hpp"
 #include "utils.hpp"
 
+#if defined(_WIN32)
+#include <windows.h> // SetConsoleOutputCP / SetConsoleCP
+#endif
+
 // main 只负责命令行交互与装配：读取用户输入、调用 AnalysisSession 门面，
 // 所有抓包 / 解析 / 入库 / 查询逻辑都在门面内部，UI（此处是 CLI）不碰实现细节。
 
@@ -83,13 +87,36 @@ void runQueryLoop(AnalysisSession& session)
 
 int main(int argc, char* argv[])
 {
+#if defined(_WIN32)
+    // 源码里的中文提示均为 UTF-8 字节；Windows 控制台默认按本地代码页(GBK/936)解码，
+    // 会把 UTF-8 中文显示成乱码。把控制台输入/输出代码页都切到 UTF-8 即可正常显示。
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+
     std::string ts               = CommonUtil::get_timestamp();
     std::string capture_log_name = "logs/capture_" + ts + ".log";
     loguru::init(argc, argv);
     loguru::add_file(capture_log_name.c_str(), loguru::Append, loguru::Verbosity_MAX);
 
-    std::string     tsharkPath = TsharkCommand::defaultTsharkPath();
+    // 自动定位 tshark：环境变量 EASYTSHARK_TSHARK → 默认路径 → PATH →（Win）注册表 → 常见目录。
+    std::string     tsharkPath = TsharkCommand::resolveTsharkPath();
     AnalysisSession session(tsharkPath, "data");
+
+    // 未检测到 tshark 时给出友好引导（本工具依赖 Wireshark 的 tshark 做抓包/解析）。
+    // 这里只提示不退出：仍进入菜单，真正用到 tshark 的操作会各自报错。
+    if (!TsharkCommand::tsharkAvailable(tsharkPath))
+    {
+        std::cerr << "警告：未检测到 tshark（已尝试路径: " << tsharkPath << "）。\n"
+                  << "本工具依赖 Wireshark 提供的 tshark。请先安装 Wireshark："
+                  << TsharkCommand::wiresharkDownloadUrl() << "\n"
+                  << "若已安装在非默认位置，可设置环境变量 EASYTSHARK_TSHARK 指向 tshark"
+#if defined(_WIN32)
+                     ".exe"
+#endif
+                  << " 的完整路径。\n"
+                  << std::endl;
+    }
 
     int mode = 0;
     std::cout << "请选择模式：\n1. 实时抓包\n2. 离线分析\n请输入选择 (1或2): ";
@@ -97,7 +124,19 @@ int main(int argc, char* argv[])
 
     if (mode == 1)
     {
-        std::vector<AdapterInfo> adapters = session.listAdapters();
+        std::vector<AdapterInfo> adapters;
+        try
+        {
+            adapters = session.listAdapters();
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "获取网卡列表失败：" << e.what() << "\n"
+                      << "请确认已安装 Wireshark（" << TsharkCommand::wiresharkDownloadUrl()
+                      << "）；若装在非默认位置，可用环境变量 EASYTSHARK_TSHARK 指定 tshark 路径。"
+                      << std::endl;
+            return 1;
+        }
         std::cout << "可用网卡列表：" << std::endl;
         for (const auto& adapter : adapters)
         {

@@ -83,6 +83,10 @@ public:
     std::string        pcapPath() const;
     const std::string& tsharkPath() const { return tsharkPath_; }
 
+    // 运行时切换 tshark 路径（GUI 里手动指定 tshark.exe 用）：更新自身并同步给
+    // analyzer_/converter_；on-demand 创建的 LiveCapture/FlowMonitor 会从 tsharkPath_ 取新值。
+    void setTsharkPath(const std::string& path);
+
 private:
     // 解析 pcapFilePath 并入库到 dbFilePath：载入与停止抓包两条路径共用的收尾。
     bool analyzeAndStore(const std::string& pcapFilePath, const std::string& dbFilePath);

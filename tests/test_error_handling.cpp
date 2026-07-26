@@ -1,8 +1,10 @@
 #include <fstream>
 #include <gtest/gtest.h>
 #include <string>
+#if !defined(_WIN32)
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include "PdmlToJsonConverter.hpp"
 #include "test_fs_util.hpp"

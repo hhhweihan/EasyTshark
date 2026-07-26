@@ -1,17 +1,24 @@
 #include "FlowMonitor.hpp"
 
-#include <cerrno>
+#include <cstdio> // fileno / fclose
 #include <ctime>
-#include <fcntl.h>
 #include <sstream>
 #include <stdexcept>
-#include <unistd.h>
 #include <vector>
 
 #include "loguru/loguru.hpp"
+#include "platform/PipeIO.hpp" // 跨平台非阻塞管道读取（替代 fcntl/read）
 #include "processUtil.hpp"
 #include "tsharkCommand.hpp"
 #include "tsharkDataType.hpp"
+
+#if defined(_WIN32)
+#include <io.h> // _fileno
+// POSIX fileno 在 MSVC 下名为 _fileno；统一到 fileno，POSIX 分支不受影响。
+#ifndef fileno
+#define fileno _fileno
+#endif
+#endif
 
 FlowMonitor::FlowMonitor(const std::string& tsharkPath)
     : tsharkPath(tsharkPath), adapterFlowTrendMonitorStartTime(0), stopFlag(false)
@@ -71,10 +78,9 @@ void FlowMonitor::getAdaptersFlowTrendData(
     // 放到锁外读会与之竞态。锁同时保护随后对 adapterFlowTrendMonitorMap 的遍历。
     std::unique_lock<std::recursive_mutex> lock(adapterFlowTrendMapLock);
 
-    // 获取所有网卡流量统计数据
     long timeNow = time(nullptr);
 
-    // 数据从最左边冒出来
+    // 滑动窗口的左右端点：
     // 一开始：以最开始监控时间为左起点，终点为未来300秒
     // 随着时间推移，数据逐渐填充完这300秒
     // 超过300秒之后，结束节点就是当前，开始节点就是当前-300
@@ -130,18 +136,17 @@ void FlowMonitor::startMonitorAdaptersFlowTrend()
             "-e", "frame.time_epoch", "-e", "frame.len"};
         LOG_F(INFO, "Starting tshark for adapter: %s", adapter.name.c_str());
 
-        pid_t tsharkPid = 0;
-        FILE* pipe      = ProcessUtil::PopenEx(tsharkArgs, &tsharkPid, "r");
+        ProcessUtil::ProcHandle tsharkPid = ProcessUtil::kInvalidProc;
+        FILE*                   pipe      = ProcessUtil::PopenEx(tsharkArgs, &tsharkPid, "r");
         if (!pipe)
         {
             LOG_F(ERROR, "Failed to start tshark for adapter: %s", adapter.name.c_str());
             continue;
         }
 
-        // 获取管道的文件描述符并设置为非阻塞模式
+        // 获取管道的文件描述符并设置为非阻塞模式（Windows 下为空操作，读时用 PeekNamedPipe）
         int pipeFd = fileno(pipe);
-        int flags  = fcntl(pipeFd, F_GETFL, 0);
-        fcntl(pipeFd, F_SETFL, flags | O_NONBLOCK);
+        platform::setPipeNonblocking(pipeFd);
 
         // 注册到事件轮询器
         if (!flowTrendPoller.add(pipeFd))
@@ -225,9 +230,10 @@ void FlowMonitor::adapterFlowTrendMonitorThreadEntry()
                 }
             }
 
-            char    buffer[256];
-            ssize_t bytesRead;
-            while ((bytesRead = read(pipeFd, buffer, sizeof(buffer))) > 0)
+            char buffer[256];
+            long bytesRead;
+            // pipeRead 三态：>0 读到数据；0 暂无数据(EAGAIN)；-1 对端关闭(EOF)/出错。
+            while ((bytesRead = platform::pipeRead(pipeFd, buffer, sizeof(buffer))) > 0)
             {
                 if (!info)
                 {
@@ -248,8 +254,8 @@ void FlowMonitor::adapterFlowTrendMonitorThreadEntry()
                 }
             }
 
-            // 检查管道是否关闭（tshark 自行退出 → EOF）
-            if (bytesRead == 0 || (bytesRead == -1 && errno != EAGAIN))
+            // 检查管道是否关闭（tshark 自行退出 → EOF）：pipeRead 返回 -1 即关闭/出错。
+            if (bytesRead < 0)
             {
                 LOG_F(INFO, "Pipe closed or error occurred for fd: %d", pipeFd);
                 flowTrendPoller.remove(pipeFd); // 先从轮询器移除，再关闭 fd
@@ -259,12 +265,12 @@ void FlowMonitor::adapterFlowTrendMonitorThreadEntry()
                 if (it != fdToAdapter.end())
                 {
                     AdapterMonitorInfo* dead = it->second;
-                    // 回收子进程避免僵尸，并把 pid 置 0，防止 stopMonitor 再对
-                    // 可能被系统复用的 pid 误发信号。
-                    if (dead->tsharkPid > 0)
+                    // 回收子进程避免僵尸，并把句柄置为无效，防止 stopMonitor 再对
+                    // 可能被系统复用的 pid/句柄误发信号。
+                    if (ProcessUtil::ValidProc(dead->tsharkPid))
                     {
                         ProcessUtil::Kill(dead->tsharkPid);
-                        dead->tsharkPid = 0;
+                        dead->tsharkPid = ProcessUtil::kInvalidProc;
                     }
                     // fclose 连带关闭底层 fd 并置空——绝不能再 close(pipeFd)，否则与
                     // fclose 造成对同一 fd 的二次关闭。置空后 stopMonitor 见空即跳过。

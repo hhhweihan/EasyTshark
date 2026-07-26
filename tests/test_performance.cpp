@@ -4,8 +4,10 @@
 #include <gtest/gtest.h>
 #include <numeric>
 #include <string>
+#if !defined(_WIN32)
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 #include <vector>
 
 #include "PdmlToJsonConverter.hpp"

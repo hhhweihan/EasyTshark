@@ -135,3 +135,76 @@ TEST(PacketParserTest, StripsTrailingNewline)
     EXPECT_EQ(packet.info, "GET / HTTP/1.1");
     EXPECT_TRUE(packet.info.find('\n') == std::string::npos);
 }
+
+// 就地数字解析应完整消费多位数字（防止 strtol 提前停下导致截断）
+TEST(PacketParserTest, ParsesMultiDigitNumericFields)
+{
+    std::vector<std::string> fields = baseFields();
+    fields[0]  = "123456"; // frame.number
+    fields[2]  = "65535";  // frame.len
+    fields[3]  = "65500";  // frame.cap_len
+    fields[10] = "54321";  // tcp.srcport
+    fields[12] = "12345";  // tcp.dstport
+
+    Packet packet;
+    ASSERT_TRUE(PacketParser::parseLine(joinFields(fields), packet));
+    EXPECT_EQ(packet.frame_number, 123456);
+    EXPECT_EQ(packet.len, 65535u);
+    EXPECT_EQ(packet.cap_len, 65500u);
+    EXPECT_EQ(packet.src_port, 54321);
+    EXPECT_EQ(packet.dst_port, 12345);
+}
+
+// TCP 端口非空时 transport 应标记为 "TCP"
+TEST(PacketParserTest, SetsTransportTcp)
+{
+    Packet packet;
+    ASSERT_TRUE(PacketParser::parseLine(joinFields(baseFields()), packet));
+    EXPECT_EQ(packet.transport, "TCP");
+}
+
+// 仅 UDP 端口非空时 transport 应标记为 "UDP"
+TEST(PacketParserTest, SetsTransportUdp)
+{
+    std::vector<std::string> fields = baseFields();
+    fields[10] = ""; // tcp.srcport 空
+    fields[11] = "53";
+    fields[12] = ""; // tcp.dstport 空
+    fields[13] = "12345";
+
+    Packet packet;
+    ASSERT_TRUE(PacketParser::parseLine(joinFields(fields), packet));
+    EXPECT_EQ(packet.transport, "UDP");
+}
+
+// 四端口全空时 transport 应保持为空
+TEST(PacketParserTest, LeavesTransportEmptyWhenNoPorts)
+{
+    std::vector<std::string> fields = baseFields();
+    fields[10] = "";
+    fields[11] = "";
+    fields[12] = "";
+    fields[13] = "";
+
+    Packet packet;
+    ASSERT_TRUE(PacketParser::parseLine(joinFields(fields), packet));
+    EXPECT_TRUE(packet.transport.empty());
+}
+
+// frame.number 非数字时应判定整行失败（就地解析未消费任何数字）
+TEST(PacketParserTest, ReturnsFalseOnNonNumericFrameNumber)
+{
+    std::vector<std::string> fields = baseFields();
+    fields[0]                       = "abc";
+    Packet packet;
+    EXPECT_FALSE(PacketParser::parseLine(joinFields(fields), packet));
+}
+
+// frame.number 为空时应判定整行失败
+TEST(PacketParserTest, ReturnsFalseOnEmptyFrameNumber)
+{
+    std::vector<std::string> fields = baseFields();
+    fields[0]                       = "";
+    Packet packet;
+    EXPECT_FALSE(PacketParser::parseLine(joinFields(fields), packet));
+}

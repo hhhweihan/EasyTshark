@@ -1,7 +1,6 @@
 #include "LiveCapture.hpp"
 
 #include <chrono>
-#include <csignal>
 #include <cstdio>
 #include <vector>
 
@@ -16,7 +15,7 @@ LiveCapture::LiveCapture(const std::string& tsharkPath, const std::string& ip2Re
       ip2RegionDbPath_(ip2RegionDbPath),
       stopFlag_(false),
       startFailed_(false),
-      tsharkPid_(-1)
+      tsharkPid_(ProcessUtil::kInvalidProc)
 {
 }
 
@@ -36,7 +35,7 @@ bool LiveCapture::startCapture(const std::string& adapterName, PacketCallback on
     LOG_F(INFO, "即将开始抓包，网卡：%s", adapterName.c_str());
     stopFlag_    = false;
     startFailed_ = false;
-    tsharkPid_   = -1;
+    tsharkPid_   = ProcessUtil::kInvalidProc;
     captureWorkThread_ = std::make_shared<std::thread>(&LiveCapture::captureWorkThreadEntry, this,
                                                        adapterName, captureFile, std::move(onPacket));
 
@@ -46,7 +45,7 @@ bool LiveCapture::startCapture(const std::string& adapterName, PacketCallback on
     // 极窄启动窗口内轮询，最多约 1s；超时仍未定则乐观返回（tshark 可能只是启动慢）。
     for (int i = 0; i < 200; ++i)
     {
-        if (tsharkPid_.load() > 0)
+        if (ProcessUtil::ValidProc(tsharkPid_.load()))
             return true;
         if (startFailed_.load())
         {
@@ -70,17 +69,18 @@ bool LiveCapture::stopCapture()
 
     // tshark 往 -w 文件写、几乎不写 stdout，只关管道它不会退出：必须发信号令其收尾，
     // 读循环随之 EOF 退出。极窄的启动窗口内 pid 可能尚未就位，短暂等待其落定。
-    pid_t pid = tsharkPid_.load();
-    for (int i = 0; pid <= 0 && i < 200; ++i)
+    ProcessUtil::ProcHandle pid = tsharkPid_.load();
+    for (int i = 0; !ProcessUtil::ValidProc(pid) && i < 200; ++i)
     {
         if (!captureWorkThread_->joinable())
             break; // 线程已提前结束（如 Popen 失败），无需再等
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         pid = tsharkPid_.load();
     }
-    // 只发信号、不 waitpid —— 交给工作线程里的 PcloseEx 统一回收，避免双重 waitpid。
-    if (pid > 0)
-        ::kill(pid, SIGTERM);
+    // 只发信号、不回收 —— 交给工作线程里的 PcloseEx 统一回收，避免双重回收。
+    // POSIX 为 SIGTERM（tshark 优雅收尾）；Windows 为 TerminateProcess（无法 flush，见 Signal 注释）。
+    if (ProcessUtil::ValidProc(pid))
+        ProcessUtil::Signal(pid);
 
     if (captureWorkThread_->joinable())
         captureWorkThread_->join();
@@ -102,8 +102,8 @@ void LiveCapture::captureWorkThreadEntry(std::string adapterName, std::string ca
         tsharkArgs.insert(tsharkArgs.end(), fieldArgs.begin(), fieldArgs.end());
 
         LOG_F(INFO, "Starting live capture on adapter: %s", adapterName.c_str());
-        pid_t tsharkPid = -1;
-        FILE* pipe      = ProcessUtil::PopenEx(tsharkArgs, &tsharkPid, "r");
+        ProcessUtil::ProcHandle tsharkPid = ProcessUtil::kInvalidProc;
+        FILE*                   pipe       = ProcessUtil::PopenEx(tsharkArgs, &tsharkPid, "r");
         if (!pipe)
         {
             LOG_F(ERROR, "Failed to run tshark command!");
@@ -141,8 +141,8 @@ void LiveCapture::captureWorkThreadEntry(std::string adapterName, std::string ca
                 onPacket(packet);
         }
 
-        ProcessUtil::PcloseEx(pipe, tsharkPid); // fclose + waitpid 回收，单点回收
-        tsharkPid_ = -1;
+        ProcessUtil::PcloseEx(pipe, tsharkPid); // fclose + 回收，单点回收
+        tsharkPid_ = ProcessUtil::kInvalidProc;
         LOG_F(INFO, "Capture thread exiting gracefully.");
     }
     catch (const std::exception& e)

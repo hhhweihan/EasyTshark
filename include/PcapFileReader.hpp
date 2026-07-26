@@ -13,7 +13,7 @@
 //   - POSIX（Linux/macOS）：mmap 整个文件，readAt 从映射区 memcpy。
 //     随机按 offset 访问免去 lseek+read 双系统调用与一次内核→用户拷贝，
 //     靠缺页中断按需调页。
-//   - 非 POSIX（含 Windows CreateFileMapping 落地前的兜底）：持有 std::ifstream，
+//   - 非 POSIX（含 Windows，暂以文件流兜底）：持有 std::ifstream，
 //     readAt 用 clear()+seekg+read；相比原实现仍省去重复 open/close。
 //
 // 非拷贝语义：持有独占的文件资源（映射/句柄/流），禁用拷贝，允许移动语义
@@ -41,7 +41,7 @@ private:
     PcapFileReader& operator=(const PcapFileReader&);
 
 #if defined(_WIN32)
-    // 兜底实现：标准库文件流（Windows 原生 CreateFileMapping 留待主题 1 二期）
+    // 兜底实现：标准库文件流（Windows 尚未使用原生 CreateFileMapping 内存映射）
     mutable std::ifstream stream_;
     uint64_t              size_;
 #else

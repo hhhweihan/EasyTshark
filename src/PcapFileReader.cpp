@@ -9,7 +9,7 @@
 // 非 POSIX 兜底实现：std::ifstream + seekg/read
 // 相比“每次取包都重新打开文件”的原实现，这里一次打开、多次随机读，
 // 省去重复的 open()/close() 系统调用，并复用文件流缓冲。
-// Windows 原生内存映射（CreateFileMapping/MapViewOfFile）留待主题 1 二期。
+// Windows 侧尚未使用原生内存映射（CreateFileMapping/MapViewOfFile），暂以文件流兜底。
 // ============================================================================
 
 PcapFileReader::PcapFileReader() : size_(0) {}
@@ -72,7 +72,7 @@ bool PcapFileReader::isOpen() const
 #else
 // ============================================================================
 // POSIX 实现：mmap 整个文件后按 offset 直接切片
-// 学习点：随机访问免去 lseek+read 双系统调用与一次内核→用户拷贝，
+// 随机访问免去 lseek+read 双系统调用与一次内核→用户拷贝，
 // 页面靠缺页中断按需调入；MAP_PRIVATE + PROT_READ 只读映射，不影响原文件。
 // ============================================================================
 
@@ -114,6 +114,12 @@ bool PcapFileReader::open(const std::string& path)
         ::close(fd);
         return false;
     }
+
+    // readAt 是“用户点选某个包才按其偏移读一小段”的随机访问模式。内核默认假设顺序
+    // 访问、对缺页做预读（readahead），会把相邻页也一并调入——对随机小读纯属浪费页缓存
+    // 与 I/O。用 MADV_RANDOM 告知内核关闭预读，只按实际缺页调入命中页。提示失败不影响
+    // 正确性（只是退回默认预读行为），故忽略返回值。
+    ::posix_madvise(addr, static_cast<size_t>(st.st_size), POSIX_MADV_RANDOM);
 
     fd_     = fd;
     mapped_ = addr;

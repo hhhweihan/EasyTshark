@@ -1,11 +1,11 @@
-// EasyTshark 原生前端（主题 10）
+// EasyTshark 原生前端
 //
 // 用 Dear ImGui（即时模式 GUI）+ GLFW/OpenGL3 后端把核心能力可视化。UI 只通过
 // AnalysisSession 门面访问数据，不直接触碰 tshark / 解析 / 数据库细节——这就是
 // 项目里的“核心库 ↔ UI 层”边界（同进程，不是网络前后端分离）。
 //
-// 布局沿用 Tab 风格（顶部工具栏 + 过滤栏 + 报文/会话/统计/查询 分页 + 底部状态栏），
-// 在其上补齐正式版界面的功能与显示，而非照搬其侧边栏布局。
+// 布局采用 Tab 风格（顶部工具栏 + 过滤栏 + 报文/会话/统计/查询 分页 + 底部状态栏），
+// 在此之上补齐各分页的功能与显示。
 //
 // 线程约定：耗时操作（载入 pcap、停止抓包后解析入库）放到 std::async 的后台任务里跑，
 // UI 线程每帧只轮询任务是否完成，从不阻塞在解析上；完成后在 UI 线程刷新报文快照。
@@ -137,7 +137,14 @@ struct AppState
     uint32_t                       detailFrame = 0;
     std::vector<std::future<bool>> detailDraining;
 
-    explicit AppState(AnalysisSession& s) : session(s) {}
+    // tshark 可执行文件路径输入框：允许用户在 GUI 里手动指定 tshark(.exe)，无需重编译。
+    // 构造时用会话当前（已自动解析）的路径回填，方便查看/修改。
+    char tsharkPathInput[512] = {0};
+
+    explicit AppState(AnalysisSession& s) : session(s)
+    {
+        std::snprintf(tsharkPathInput, sizeof(tsharkPathInput), "%s", s.tsharkPath().c_str());
+    }
 };
 
 // ---- 小工具 ----
@@ -177,7 +184,7 @@ bool isPrivateIp(const std::string& ip)
     return false;
 }
 
-// 协议名 → 颜色，让表格里的协议列像正式版一样有彩色徽标。
+// 协议名 → 颜色：为表格协议列提供彩色徽标，便于快速区分。
 ImVec4 protocolColor(const std::string& proto)
 {
     if (containsIgnore(proto, "TCP"))
@@ -235,7 +242,21 @@ void pollAsync(AppState& s)
     if (s.pending.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
         return;
 
-    bool ok  = s.pending.get();
+    bool ok = false;
+    try
+    {
+        ok = s.pending.get();
+    }
+    catch (const std::exception& e)
+    {
+        // 后台任务（载入 pcap、抓包、显示过滤等）内部启动 tshark 失败时会抛异常，
+        // future::get 会在 UI 线程重新抛出。这里兜住，转成失败状态，避免闪退。
+        ok       = false;
+        s.busy   = false;
+        s.status = std::string("失败：") + e.what();
+        s.onDone = nullptr;
+        return;
+    }
     s.busy   = false;
     s.status = ok ? "完成" : "失败";
     if (ok && s.onDone)
@@ -536,12 +557,54 @@ void drawToolbar(AppState& s)
     }
     ImGui::EndDisabled();
 
+    // tshark 路径：显示当前解析到的路径，允许手动改指到 tshark(.exe) 后应用（无需重编译）。
+    // 未检测到时红字提示并给出下载地址，引导用户安装 Wireshark。
+    ImGui::TextUnformatted("tshark 路径:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(360);
+    ImGui::InputTextWithHint("##tsharkpath", "tshark 可执行文件完整路径", s.tsharkPathInput,
+                             sizeof(s.tsharkPathInput));
+    ImGui::SameLine();
+    ImGui::BeginDisabled(s.busy || s.session.isCapturing());
+    if (ImGui::Button("应用路径"))
+    {
+        s.session.setTsharkPath(s.tsharkPathInput);
+        if (TsharkCommand::tsharkAvailable(s.tsharkPathInput))
+            s.status = "已应用 tshark 路径";
+        else
+            s.status = "路径无效：该位置未找到 tshark，请重新指定";
+    }
+    ImGui::EndDisabled();
+    if (!TsharkCommand::tsharkAvailable(s.tsharkPathInput))
+    {
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f),
+                           "未检测到 tshark，请安装 Wireshark: %s",
+                           TsharkCommand::wiresharkDownloadUrl().c_str());
+    }
+
     // 实时抓包
     ImGui::TextUnformatted("实时抓包:");
     ImGui::SameLine();
     if (ImGui::Button("刷新网卡"))
     {
-        s.adapters = s.session.listAdapters();
+        // 枚举网卡会启动 tshark 子进程；若 tshark 未安装/不在默认路径，listAdapters 会抛
+        // std::runtime_error。这里必须捕获——否则异常冲出 ImGui 帧循环导致整个窗口闪退。
+        try
+        {
+            s.adapters = s.session.listAdapters();
+            if (s.adapters.empty())
+                s.status = "未找到网卡（请确认已安装 Wireshark 且有足够权限）";
+            else
+                s.status = "已刷新网卡，共 " + std::to_string(s.adapters.size()) + " 个";
+        }
+        catch (const std::exception& e)
+        {
+            s.adapters.clear();
+            s.adapterName[0] = 0;
+            s.status         = std::string("刷新网卡失败：") + e.what() +
+                       "（请确认已安装 Wireshark：C:\\Program Files\\Wireshark\\tshark.exe）";
+        }
     }
     ImGui::SameLine();
     ImGui::SetNextItemWidth(220);
@@ -1047,9 +1110,14 @@ void drawStatusBar(AppState& s)
 
     if (ImGui::BeginPopupModal("关于 EasyTshark", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
     {
-        ImGui::TextUnformatted("EasyTshark —— 基于 tshark 的抓包分析学习项目");
-        ImGui::TextUnformatted("前端: Dear ImGui + GLFW/OpenGL3");
-        ImGui::TextUnformatted("核心库经 AnalysisSession 门面暴露能力（同进程 核心库↔UI 边界）");
+        ImGui::TextUnformatted("EasyTshark · 网络抓包与协议分析工具");
+        ImGui::Spacing();
+        ImGui::TextUnformatted("基于 Wireshark / tshark 内核，支持实时抓包、离线 pcap 分析");
+        ImGui::TextUnformatted("以及会话追踪、协议分布与流量趋势统计。");
+        ImGui::Spacing();
+        ImGui::TextUnformatted("界面框架：Dear ImGui + GLFW / OpenGL3");
+        ImGui::Text("运行依赖：Wireshark（tshark）  ·  %s",
+                    TsharkCommand::wiresharkDownloadUrl().c_str());
         ImGui::Separator();
         if (ImGui::Button("关闭"))
             ImGui::CloseCurrentPopup();
@@ -1061,10 +1129,18 @@ void drawStatusBar(AppState& s)
 void setupChineseFont()
 {
     const char* candidates[] = {
+#if defined(_WIN32)
+        // Windows 常见中文字体（微软雅黑 / 黑体 / 宋体），随系统预装。
+        "C:/Windows/Fonts/msyh.ttc",
+        "C:/Windows/Fonts/msyh.ttf",
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
+#else
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/STHeiti Light.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+#endif
     };
     ImGuiIO& io = ImGui::GetIO();
     for (const char* path : candidates)
@@ -1121,7 +1197,8 @@ int main(int, char**)
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init(glsl_version);
 
-    AnalysisSession session(TsharkCommand::defaultTsharkPath(), "data");
+    // 自动定位 tshark：环境变量 EASYTSHARK_TSHARK → 默认路径 → PATH →（Win）注册表 → 常见目录。
+    AnalysisSession session(TsharkCommand::resolveTsharkPath(), "data");
     AppState        state(session);
 
     while (!glfwWindowShouldClose(window))

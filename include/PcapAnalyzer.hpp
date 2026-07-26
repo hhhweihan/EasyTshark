@@ -4,7 +4,6 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "PcapFileReader.hpp"
@@ -72,7 +71,10 @@ private:
     // 避免每次取包都重新 open/close 文件（POSIX 走 mmap，非 POSIX 走 ifstream）。
     PcapFileReader fileReader;
 
-    std::unordered_map<uint32_t, std::shared_ptr<Packet>> allPackets;
+    // tshark 的 frame_number 从 1 起、稠密递增，故用 vector 按 (帧号-1) 下标直存：
+    // 相比 unordered_map 省去每包一次哈希桶节点分配与哈希/取模，遍历也变成对连续内存的
+    // 顺序扫描，对 CPU cache 与预取器都更友好。理论上若出现空洞，对应槽为空指针。
+    std::vector<std::shared_ptr<Packet>> allPackets;
 };
 
 #endif

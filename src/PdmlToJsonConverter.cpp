@@ -2,8 +2,10 @@
 
 #include <fstream>
 #include <iostream>
-#include <sys/wait.h>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/wait.h> // WIFEXITED / WEXITSTATUS（POSIX 专有）
+#endif
 
 #include "rapidjson/prettywriter.h"
 #include "rapidjson/stringbuffer.h"
@@ -20,7 +22,6 @@ void PdmlToJsonConverter::convertXmlNodeToJson(rapidxml::xml_node<>* xmlNode,
                                                rapidjson::Value&     jsonNode,
                                                rapidjson::Document::AllocatorType& allocator)
 {
-    // 处理节点的属性
     for (rapidxml::xml_attribute<>* attr = xmlNode->first_attribute(); attr;
          attr                            = attr->next_attribute())
     {
@@ -28,7 +29,6 @@ void PdmlToJsonConverter::convertXmlNodeToJson(rapidxml::xml_node<>* xmlNode,
                            rapidjson::Value(attr->value(), allocator), allocator);
     }
 
-    // 处理子节点
     bool hasChildNodes = false;
     for (rapidxml::xml_node<>* child = xmlNode->first_node(); child; child = child->next_sibling())
     {
@@ -38,7 +38,7 @@ void PdmlToJsonConverter::convertXmlNodeToJson(rapidxml::xml_node<>* xmlNode,
         jsonNode.AddMember(rapidjson::Value(child->name(), allocator), childJson, allocator);
     }
 
-    // 如果没有子节点，处理文本内容
+    // 无子节点时，将节点文本作为字符串值
     if (!hasChildNodes && xmlNode->value_size() > 0)
     {
         jsonNode.SetString(xmlNode->value(), allocator);
@@ -51,8 +51,8 @@ bool PdmlToJsonConverter::convertPcapToXml(const std::string& pcapFile, const st
     // 用 argv 方式执行 tshark，父进程读取 pdml 输出并写入 XML 文件，
     // 避免走 shell 和 ">" 重定向，消除文件路径注入风险
     std::vector<std::string> args = {tsharkPath, "-r", pcapFile, "-T", "pdml"};
-    pid_t tsharkPid = -1;
-    FILE* pipe = ProcessUtil::PopenEx(args, &tsharkPid, "r");
+    ProcessUtil::ProcHandle tsharkPid = ProcessUtil::kInvalidProc;
+    FILE*                    pipe      = ProcessUtil::PopenEx(args, &tsharkPid, "r");
     if (!pipe)
     {
         LOG_F(ERROR, "Failed to run tshark for pcap->xml conversion");
@@ -76,7 +76,12 @@ bool PdmlToJsonConverter::convertPcapToXml(const std::string& pcapFile, const st
     xmlOut.close();
 
     int status = ProcessUtil::PcloseEx(pipe, tsharkPid);
+#if defined(_WIN32)
+    // Windows 下 PcloseEx 直接返回进程退出码（0 成功），无 waitpid 状态位可解析。
+    return status == 0;
+#else
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+#endif
 }
 
 // 将XML文件转换为JSON文件
@@ -84,7 +89,6 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
 {
     try
     {
-        // 读取XML文件
         std::ifstream xmlFileStream(xmlFile);
         if (!xmlFileStream.is_open())
         {
@@ -96,7 +100,6 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
                                std::istreambuf_iterator<char>());
         xmlFileStream.close();
 
-        // 使用RapidXML解析XML
         rapidxml::xml_document<> doc;
         doc.parse<0>(&xmlContent[0]);
 
@@ -126,18 +129,14 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
             }
         }
 
-        // 创建packet数组
         rapidjson::Value packetArray(rapidjson::kArrayType);
 
-        // 处理所有packet节点
         for (rapidxml::xml_node<>* packetNode = pdmlNode->first_node("packet"); packetNode;
              packetNode                       = packetNode->next_sibling("packet"))
         {
 
-            // 创建单个packet对象
             rapidjson::Value packetObj(rapidjson::kObjectType);
 
-            // 添加packet属性
             for (rapidxml::xml_attribute<>* attr = packetNode->first_attribute(); attr;
                  attr                            = attr->next_attribute())
             {
@@ -145,18 +144,14 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
                                    rapidjson::Value(attr->value(), allocator).Move(), allocator);
             }
 
-            // 创建proto数组
             rapidjson::Value protoArray(rapidjson::kArrayType);
 
-            // 处理所有proto节点
             for (rapidxml::xml_node<>* protoNode = packetNode->first_node("proto"); protoNode;
                  protoNode                       = protoNode->next_sibling("proto"))
             {
 
-                // 创建单个proto对象
                 rapidjson::Value protoObj(rapidjson::kObjectType);
 
-                // 添加proto属性
                 for (rapidxml::xml_attribute<>* attr = protoNode->first_attribute(); attr;
                      attr                            = attr->next_attribute())
                 {
@@ -165,7 +160,6 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
                                        allocator);
                 }
 
-                // 处理field节点
                 if (protoNode->first_node("field"))
                 {
                     rapidjson::Value fieldArray(rapidjson::kArrayType);
@@ -176,7 +170,6 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
 
                         rapidjson::Value fieldObj(rapidjson::kObjectType);
 
-                        // 添加field属性
                         for (rapidxml::xml_attribute<>* attr = fieldNode->first_attribute(); attr;
                              attr                            = attr->next_attribute())
                         {
@@ -185,7 +178,7 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
                                                allocator);
                         }
 
-                        // 处理子field节点
+                        // 递归展开嵌套的 field 子节点
                         if (fieldNode->first_node("field"))
                         {
                             rapidjson::Value subFieldArray(rapidjson::kArrayType);
@@ -197,7 +190,6 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
 
                                 rapidjson::Value subFieldObj(rapidjson::kObjectType);
 
-                                // 添加子field属性
                                 for (rapidxml::xml_attribute<>* attr =
                                          subFieldNode->first_attribute();
                                      attr; attr = attr->next_attribute())
@@ -229,7 +221,6 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
 
         pdmlObj.AddMember("packet", packetArray, allocator);
 
-        // 构建最终的JSON结构
         jsonDoc.AddMember("pdml", pdmlObj, allocator);
 
         // 翻译showname字段，针对所有数据包的proto字段
@@ -253,12 +244,10 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
             }
         }
 
-        // 序列化JSON数据
         rapidjson::StringBuffer                          jsonBuffer;
         rapidjson::PrettyWriter<rapidjson::StringBuffer> jsonWriter(jsonBuffer);
         jsonDoc.Accept(jsonWriter);
 
-        // 保存JSON文件
         std::ofstream jsonFileStream(jsonFile);
         if (!jsonFileStream.is_open())
         {

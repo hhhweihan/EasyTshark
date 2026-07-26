@@ -1,5 +1,6 @@
 # 忽略文件夹内容
 build/
+build_win/
 output/data/*
 output/logs/*
 test_data/*
@@ -8,6 +9,7 @@ test_data/*
 output/tshark_main
 output/unit_tests
 output/tshark_gui
+output/*.exe
 
 # 运行时产物：GUI 布局、日志、抓包输出，均为本地运行生成，不纳入版本控制
 imgui.ini

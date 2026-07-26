@@ -12,7 +12,7 @@
 // 且 Linux 与 macOS 可以共用同一份实现（见 src/platform/EventPollerPoll.cpp）。
 //
 // 设计要点：头文件不引入 <poll.h>，成员只保存原始 fd，具体的 pollfd
-// 数组在 .cpp 内临时构造，从而让业务代码（tsharkManager）完全不感知底层机制。
+// 数组在 .cpp 内临时构造，从而让业务代码（FlowMonitor）完全不感知底层机制。
 class EventPoller
 {
 public:

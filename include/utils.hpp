@@ -54,13 +54,6 @@ public:
     static std::string get_timestamp();
 
     /**
-     * @brief UTF8字符串转ANSI字符串
-     * @param utf8Str UTF8编码的字符串
-     * @return ANSI编码的字符串
-     */
-    static std::string UTF8ToANSIString(const std::string& utf8Str);
-
-    /**
      * @brief 翻译字段名称
      * @param value rapidjson值对象
      * @param allocator rapidjson分配器
@@ -105,12 +98,18 @@ public:
     bool insertPacket(std::vector<std::shared_ptr<Packet>>& packets);
 
     /**
-     * @brief 查询所有数据包
+     * @brief 查询数据包（可选分页）
      * @param packetList 用于存储查询结果的列表
+     * @param limit 最多返回的行数；<0 表示不分页、返回全部（默认，保持旧行为）
+     * @param offset 跳过的行数，仅在 limit>=0 时生效
      * @return true 查询成功
      * @return false 查询失败
+     *
+     * @note limit>=0 时按 frame_number 升序返回，保证翻页结果稳定；
+     *       大抓包下用分页可避免一次性把全表读进内存造成内存尖峰。
      */
-    bool queryPacket(std::vector<std::shared_ptr<Packet>>& packetList);
+    bool queryPacket(std::vector<std::shared_ptr<Packet>>& packetList, int limit = -1,
+                     int offset = 0);
 
     /**
      * @brief 根据条件查询数据包并返回JSON格式结果

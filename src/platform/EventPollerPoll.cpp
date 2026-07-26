@@ -3,7 +3,7 @@
 // poll() 是 POSIX 标准，在所有类 Unix 系统上可用，且支持管道 fd，
 // 因此一份代码即可覆盖 Linux + macOS，无需为 mac 单独写 kqueue。
 // Windows 无法用它多路复用匿名管道（WSAPoll 仅限 socket），
-// 届时另建 src/platform/EventPollerWin.cpp 实现同一套接口。
+// 由 src/platform/EventPollerWin.cpp 实现同一套接口。
 
 #include "platform/EventPoller.hpp"
 

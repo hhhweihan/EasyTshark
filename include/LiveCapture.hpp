@@ -5,9 +5,9 @@
 #include <functional>
 #include <memory>
 #include <string>
-#include <sys/types.h> // pid_t
 #include <thread>
 
+#include "processUtil.hpp" // ProcessUtil::ProcHandle（跨平台进程句柄）
 #include "tsharkDataType.hpp"
 
 // 实时抓包：在指定网卡上启动 tshark，一边把原始报文写入 pcap 文件（-w），一边用
@@ -48,7 +48,7 @@ private:
     std::string                  ip2RegionDbPath_;
     std::atomic<bool>            stopFlag_;
     std::atomic<bool>            startFailed_; // 工作线程启动 tshark 失败时置位，供 startCapture 回传
-    std::atomic<pid_t>           tsharkPid_;   // 供 stopCapture 发信号；-1 表示未就位
+    std::atomic<ProcessUtil::ProcHandle> tsharkPid_; // 供 stopCapture 发信号；kInvalidProc 表示未就位
     std::shared_ptr<std::thread> captureWorkThread_;
 };
 

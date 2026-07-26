@@ -6,6 +6,10 @@
 #include <set>
 #include <sys/stat.h>
 
+#if defined(_WIN32)
+#include <direct.h> // _mkdir
+#endif
+
 #include "loguru/loguru.hpp"
 #include "tsharkCommand.hpp"
 
@@ -17,10 +21,18 @@ namespace
 // 创建单层目录，已存在也视为成功
 bool ensureDir(const std::string& dir)
 {
+#if defined(_WIN32)
+    // Windows 无 POSIX mkdir 的权限位参数；_mkdir 仅接受路径。
+    if (_mkdir(dir.c_str()) == 0)
+    {
+        return true;
+    }
+#else
     if (mkdir(dir.c_str(), 0755) == 0)
     {
         return true;
     }
+#endif
     return errno == EEXIST;
 }
 
@@ -70,6 +82,14 @@ AnalysisSession::AnalysisSession(const std::string& tsharkPath, const std::strin
 
 // unique_ptr 成员的析构需要完整类型：即便无额外逻辑也在 .cpp 里落定义。
 AnalysisSession::~AnalysisSession() = default;
+
+void AnalysisSession::setTsharkPath(const std::string& path)
+{
+    tsharkPath_ = path;
+    analyzer_.setTsharkPath(path);
+    converter_.setTsharkPath(path);
+    // capture_/flow_ 每次操作按 tsharkPath_ 新建，无需在此同步已存在实例。
+}
 
 bool AnalysisSession::loadPcap(const std::string& srcPath)
 {

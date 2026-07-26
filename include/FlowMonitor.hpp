@@ -11,6 +11,7 @@
 #include <unordered_map>
 
 #include "platform/EventPoller.hpp"
+#include "processUtil.hpp" // ProcessUtil::ProcHandle（跨平台进程句柄）
 
 // 单块网卡的流量监控状态
 class AdapterMonitorInfo
@@ -19,13 +20,13 @@ public:
     AdapterMonitorInfo()
     {
         monitorTsharkPipe = nullptr;
-        tsharkPid         = 0;
+        tsharkPid         = ProcessUtil::kInvalidProc;
     }
     std::string                  adapterName;       // 网卡名称
     std::map<long, long>         flowTrendData;     // 流量趋势数据
     std::shared_ptr<std::thread> monitorThread;     // 负责监控该网卡输出的线程
     FILE*                        monitorTsharkPipe; // 线程与tshark通信的管道
-    pid_t                        tsharkPid;         // 负责捕获该网卡数据的tshark进程PID
+    ProcessUtil::ProcHandle      tsharkPid;         // 负责捕获该网卡数据的tshark进程句柄
     // 单次 read 可能只读到半行、也可能一次读到多行；用它跨 read 暂存未完成的行尾，
     // 凑齐一个 '\n' 再解析，避免丢弃同一 read 里的后续行（旧实现只解析第一行）。
     std::string readLeftover;
@@ -59,7 +60,7 @@ private:
 
 private:
     std::string tsharkPath;
-    EventPoller flowTrendPoller; // 网卡流量监控的事件轮询器（替代原 epoll）
+    EventPoller flowTrendPoller; // 网卡流量监控的事件轮询器
 
     std::map<std::string, AdapterMonitorInfo> adapterFlowTrendMonitorMap;
 
@@ -72,8 +73,8 @@ private:
     std::recursive_mutex adapterFlowTrendMapLock;
     long                 adapterFlowTrendMonitorStartTime;
 
-    // 监控工作线程与其停止标志：改 detach 为 joinable，stop 时先置位再 join，
-    // 保证撕毁监控 map 前线程已退出，消除线程读裸指针的竞态。
+    // 监控工作线程与其停止标志：线程 joinable，stop 时先置停止标志再 join，
+    // 确保销毁监控 map 前线程已退出，消除线程读裸指针的竞态。
     std::thread       flowTrendThread;
     std::atomic<bool> stopFlag;
 };

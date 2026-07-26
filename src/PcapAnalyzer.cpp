@@ -30,7 +30,7 @@ bool PcapAnalyzer::streamPackets(
     std::vector<std::string> fieldArgs  = TsharkCommand::tsharkFieldArgs();
     tsharkArgs.insert(tsharkArgs.end(), fieldArgs.begin(), fieldArgs.end());
 
-    pid_t tsharkPid = -1;
+    ProcessUtil::ProcHandle tsharkPid = ProcessUtil::kInvalidProc;
     FILE* pipe = ProcessUtil::PopenEx(tsharkArgs, &tsharkPid, "r");
     if (!pipe)
     {
@@ -62,13 +62,10 @@ bool PcapAnalyzer::streamPackets(
             return false;
         }
 
-        // 计算当前报文的偏移，然后记录在Packet对象中
+        // 记录本包在文件中的偏移，再按 包头 + 抓包长度 前移游标（64 位累加，避免大文件溢出）。
         packet->file_offset = file_offset + sizeof(PacketHeader);
+        file_offset         = file_offset + sizeof(PacketHeader) + packet->cap_len;
 
-        // 更新偏移游标
-        file_offset = file_offset + sizeof(PacketHeader) + packet->cap_len;
-
-        // 获取IP地理位置
         if (ip2RegionReady)
         {
             packet->src_location = IP2RegionUtil::getIpLocation(packet->src_ip);
@@ -117,18 +114,19 @@ bool PcapAnalyzer::analysisFile(const std::string& filePath,
 {
     allPackets.clear();
 
-    // 调用原有的analysisFile方法
     if (!analysisFile(filePath))
     {
         return false;
     }
 
-    // 将allPackets中的数据复制到packets中
     packets.clear();
     packets.reserve(allPackets.size());
-    for (const auto& pair : allPackets)
+    for (const auto& packet : allPackets)
     {
-        packets.push_back(pair.second);
+        if (packet) // 跳过可能存在的空洞槽
+        {
+            packets.push_back(packet);
+        }
     }
 
     return true;
@@ -136,17 +134,31 @@ bool PcapAnalyzer::analysisFile(const std::string& filePath,
 
 void PcapAnalyzer::processPacket(const std::shared_ptr<Packet>& packet)
 {
-    // 将分析的数据包插入保存起来
-    allPackets.insert(std::make_pair(packet->frame_number, packet));
+    // tshark 的 frame_number 从 1 起、稠密递增，用 (帧号-1) 作下标直接落入连续内存：
+    // 顺序插入时等价于 push_back，省去 unordered_map 每包一次的哈希桶节点分配与哈希计算。
+    if (packet->frame_number <= 0)
+    {
+        return; // 帧号异常（理论上不会出现），无法映射到下标，跳过
+    }
+    size_t idx = static_cast<size_t>(packet->frame_number) - 1;
+    if (idx >= allPackets.size())
+    {
+        // 顺序到达时每次仅 +1；vector 的几何增长保证整体仍是摊还 O(1)。
+        // 若偶发乱序/空洞，留空槽也能保证按帧号随机访问不越界。
+        allPackets.resize(idx + 1);
+    }
+    allPackets[idx] = packet;
 }
 
 void PcapAnalyzer::printAllPackets()
 {
     LOG_F(INFO, "Number of packets: %zu", allPackets.size());
-    for (const auto& pair : allPackets)
+    for (const auto& packet : allPackets)
     {
-        std::shared_ptr<Packet> packet = pair.second;
-        // 构建JSON对象
+        if (!packet) // 跳过可能存在的空洞槽
+        {
+            continue;
+        }
         rapidjson::Document                 pktObj;
         rapidjson::Document::AllocatorType& allocator = pktObj.GetAllocator();
         pktObj.SetObject();
@@ -170,7 +182,6 @@ void PcapAnalyzer::printAllPackets()
         pktObj.AddMember("cap_len", packet->cap_len, allocator);
         pktObj.AddMember("len", packet->len, allocator);
 
-        // 序列化为 JSON 字符串
         rapidjson::StringBuffer                    buffer;
         rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
         pktObj.Accept(writer);
@@ -199,14 +210,15 @@ bool PcapAnalyzer::getPacketHexData(uint32_t frameNumber, std::vector<unsigned c
         return false;
     }
 
-    auto it = allPackets.find(frameNumber);
-    if (it == allPackets.end())
+    // 帧号从 1 起、按 (帧号-1) 定位到连续内存；越界或空洞槽都视为未找到
+    if (frameNumber == 0 || frameNumber > allPackets.size() ||
+        !allPackets[frameNumber - 1])
     {
         LOG_F(ERROR, "未找到帧号 %u 对应的报文", frameNumber);
         return false;
     }
 
-    const std::shared_ptr<Packet>& packet  = it->second;
+    const std::shared_ptr<Packet>& packet  = allPackets[frameNumber - 1];
     uint32_t                       cap_len = packet->cap_len;
     // 一次打开、按偏移随机读：POSIX 下从 mmap 映射区直接切片，无重复 open/read
     if (!fileReader.readAt(packet->file_offset, cap_len, buffer))
@@ -272,7 +284,7 @@ bool PcapAnalyzer::getPacketDetailTree(uint32_t frameNumber, DetailNode& root)
     std::vector<std::string> args   = {tsharkPath, "-r", currentFilePath, "-Y",
                                        filter,     "-T", "pdml"};
 
-    pid_t tsharkPid = -1;
+    ProcessUtil::ProcHandle tsharkPid = ProcessUtil::kInvalidProc;
     FILE* pipe      = ProcessUtil::PopenEx(args, &tsharkPid, "r");
     if (!pipe)
     {
@@ -340,7 +352,7 @@ bool PcapAnalyzer::getFramesByDisplayFilter(const std::string&     displayFilter
                                      "-T",          "fields",
                                      "-e",          "frame.number"};
 
-    pid_t tsharkPid = -1;
+    ProcessUtil::ProcHandle tsharkPid = ProcessUtil::kInvalidProc;
     FILE* pipe      = ProcessUtil::PopenEx(args, &tsharkPid, "r");
     if (!pipe)
     {

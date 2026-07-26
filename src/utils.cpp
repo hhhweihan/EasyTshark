@@ -2,7 +2,6 @@
 #include <chrono>
 #include <ctime>
 #include <fstream>
-#include <iconv.h>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -116,53 +115,79 @@ std::string IP2RegionUtil::getIpLocation(const std::string& ip)
         return "";
     }
 
-    // if is IPv6, return empty string
+    // IPv4 文本最长 15 字符（xxx.xxx.xxx.xxx），更长即视为 IPv6；ip2region 仅支持 IPv4。
     if (ip.size() > 15)
     {
         return "";
     }
 
-    std::string location = xdb->search(ip);
-    if (!location.empty() && location.find("invalid") == std::string::npos)
+    // 记忆化：真实流量里少数 IP 贡献了绝大多数报文（工作集小、调用量大），命中缓存即可
+    // 跳过 xdb 二分查找与 parseLocation 的分配。离线分析与抓包线程可能并发调用，用一把
+    // 静态 mutex 守护；未命中时的锁开销远小于一次查表+解析，命中时几乎零成本。
+    static std::unordered_map<std::string, std::string> locationCache;
+    static std::mutex                                    cacheMutex;
     {
-        return parseLocation(location);
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto                        it = locationCache.find(ip);
+        if (it != locationCache.end())
+        {
+            return it->second;
+        }
     }
-    else
+
+    std::string location;
+    std::string raw = xdb->search(ip);
+    if (!raw.empty() && raw.find("invalid") == std::string::npos)
     {
-        return "";
+        location = parseLocation(raw);
     }
+    // 连空结果（无效/查不到）也缓存，避免同一个坏 IP 反复触发查表。
+
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        locationCache.emplace(ip, location);
+    }
+    return location;
 }
 
 std::string IP2RegionUtil::parseLocation(const std::string& input)
 {
-    std::vector<std::string> tokens;
-    std::string              token;
-    std::stringstream        ss(input);
-
     if (input.find("内网") != std::string::npos)
     {
         return "内网";
     }
 
-    while (std::getline(ss, token, '|'))
+    // 按 '|' 切分为「国家|区域|省份|城市|ISP」5 段。手动扫描按需 substr，
+    // 避免 std::stringstream + getline 每次调用都构造流对象、逐字符搬运的额外开销。
+    std::string tokens[5];
+    int         count = 0;
+    size_t      start = 0;
+    while (count < 5)
     {
-        tokens.push_back(token);
+        size_t pos = input.find('|', start);
+        if (pos == std::string::npos)
+        {
+            tokens[count++] = input.substr(start);
+            break;
+        }
+        tokens[count++] = input.substr(start, pos - start);
+        start           = pos + 1;
     }
 
-    if (tokens.size() >= 4)
+    if (count >= 4)
     {
         std::string result;
-        if (tokens[0].compare("0") != 0)
+        if (tokens[0] != "0")
         {
             result.append(tokens[0]);
         }
-        if (tokens[2].compare("0") != 0)
+        if (tokens[2] != "0")
         {
-            result.append("-" + tokens[2]);
+            result.append("-").append(tokens[2]);
         }
-        if (tokens[3].compare("0") != 0)
+        if (tokens[3] != "0")
         {
-            result.append("-" + tokens[3]);
+            result.append("-").append(tokens[3]);
         }
 
         return result;
@@ -199,39 +224,23 @@ bool IP2RegionUtil::init(const std::string& xdbFilePath)
     return xdbPtr != nullptr;
 }
 
-std::string CommonUtil::UTF8ToANSIString(const std::string& utf8Str)
-{
-    if (utf8Str.empty())
-        return "";
-
-    iconv_t cd = iconv_open("ANSI", "UTF-8");
-    if (cd == (iconv_t)-1)
-        return "";
-
-    size_t            inBytesLeft  = utf8Str.size();
-    size_t            outBytesLeft = utf8Str.size() * 2;
-    std::vector<char> outBuf(outBytesLeft);
-    char*             inBuf     = const_cast<char*>(utf8Str.c_str());
-    char*             outBufPtr = outBuf.data();
-
-    if (iconv(cd, &inBuf, &inBytesLeft, &outBufPtr, &outBytesLeft) == (size_t)-1)
-    {
-        iconv_close(cd);
-        return "";
-    }
-
-    iconv_close(cd);
-    return std::string(outBuf.begin(), outBuf.begin() + (outBuf.size() - outBytesLeft));
-}
-
 std::string CommonUtil::get_timestamp()
 {
     auto now      = std::chrono::system_clock::now();
     auto now_time = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
+    // std::localtime 返回指向共享静态缓冲区的指针，并发调用会相互覆盖（数据竞争）。
+    // 改用可重入版本写入线程内的 tm：POSIX 用 localtime_r，Windows 用 localtime_s。
+    std::tm tm_buf{};
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &now_time);
+#else
+    localtime_r(&now_time, &tm_buf);
+#endif
+
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&now_time), "%Y%m%d%H%M%S");
+    ss << std::put_time(&tm_buf, "%Y%m%d%H%M%S");
     ss << std::setfill('0') << std::setw(3) << ms.count();
 
     return ss.str();
@@ -349,7 +358,6 @@ void CommonUtil::translateShowNameFields(rapidjson::Value&                   val
             }
         }
 
-        // 有 "field" 字段，递归处理
         if (value.HasMember("field") && value["field"].IsArray())
         {
             rapidjson::Value& fieldArray = value["field"];
@@ -370,7 +378,6 @@ void CommonUtil::translateShowNameFields(rapidjson::Value&                   val
 
 SQLiteUtil::SQLiteUtil(const std::string& dbname)
 {
-    // 打开数据库连接
     int rc = sqlite3_open(dbname.c_str(), &db);
     if (rc != SQLITE_OK)
     {
@@ -378,6 +385,17 @@ SQLiteUtil::SQLiteUtil(const std::string& dbname)
         sqlite3_close(db);
         throw std::runtime_error("Failed to open database");
     }
+
+    // 性能取舍：这个库是可从 pcap 随时重建的「派生缓存」，不需要为掉电持久化付出
+    // 每次 COMMIT 都 fsync 回滚日志 + 数据文件的代价。fsync 是把数据强制刷到物理盘的
+    // 屏障，会让入库流水线卡在磁盘 I/O 上；实时抓包多批次入库时这笔开销尤其明显。
+    //   - journal_mode=MEMORY：回滚日志放内存，省去日志文件的创建与 fsync；
+    //   - synchronous=OFF：COMMIT 不再 fsync（掉电可能损坏，但源头 pcap 仍在，可重建）；
+    //   - temp_store=MEMORY：临时表/索引走内存。
+    // 这些 PRAGMA 失败只会退化回更慢但同样正确的默认行为，不影响功能，故不因此中断构造。
+    sqlite3_exec(db, "PRAGMA journal_mode = MEMORY;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA synchronous = OFF;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", nullptr, nullptr, nullptr);
 }
 
 SQLiteUtil::~SQLiteUtil()
@@ -391,7 +409,6 @@ SQLiteUtil::~SQLiteUtil()
 
 bool SQLiteUtil::createPacketTable()
 {
-    // 检查表是否存在，若不存在则创建
     std::string createTableSQL = R"(
         CREATE TABLE IF NOT EXISTS t_packets (
             frame_number INTEGER PRIMARY KEY,
@@ -429,11 +446,9 @@ bool SQLiteUtil::createPacketTable()
 
 bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
 {
-    // 实现插入数据的逻辑
-    // 开启事务
+    // 单事务批量插入：整批要么全部提交，出错则整体回滚。
     sqlite3_exec(db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
 
-    // SQL 插入语句
     std::string insertSQL = R"(
         INSERT INTO t_packets (
             frame_number, time, cap_len, len, src_mac, dst_mac, src_ip, src_location, src_port,
@@ -448,24 +463,35 @@ bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
         return false;
     }
 
-    // 遍历列表并插入数据
     bool hasError = false;
     for (const auto& packet : packets)
     {
+        // 绑定文本列时传入显式字节长度（.size()）而非 -1：-1 会让 SQLite 对每个
+        // 字符串各做一次 strlen 扫描，批量插入 N 包 × 8 列即 8N 次全串扫描。std::string
+        // 已知长度，直接给出可省去这些扫描；SQLITE_STATIC 表示不拷贝，字符串由 packet
+        // 在本次事务结束前持有，保证有效。
         sqlite3_bind_int(stmt, 1, packet->frame_number);
         sqlite3_bind_double(stmt, 2, packet->time);
         sqlite3_bind_int(stmt, 3, packet->cap_len);
         sqlite3_bind_int(stmt, 4, packet->len);
-        sqlite3_bind_text(stmt, 5, packet->src_mac.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 6, packet->dst_mac.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 7, packet->src_ip.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 8, packet->src_location.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 5, packet->src_mac.c_str(),
+                          static_cast<int>(packet->src_mac.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 6, packet->dst_mac.c_str(),
+                          static_cast<int>(packet->dst_mac.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 7, packet->src_ip.c_str(),
+                          static_cast<int>(packet->src_ip.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 8, packet->src_location.c_str(),
+                          static_cast<int>(packet->src_location.size()), SQLITE_STATIC);
         sqlite3_bind_int(stmt, 9, packet->src_port);
-        sqlite3_bind_text(stmt, 10, packet->dst_ip.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 11, packet->dst_location.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 10, packet->dst_ip.c_str(),
+                          static_cast<int>(packet->dst_ip.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 11, packet->dst_location.c_str(),
+                          static_cast<int>(packet->dst_location.size()), SQLITE_STATIC);
         sqlite3_bind_int(stmt, 12, packet->dst_port);
-        sqlite3_bind_text(stmt, 13, packet->protocol.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 14, packet->info.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 13, packet->protocol.c_str(),
+                          static_cast<int>(packet->protocol.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 14, packet->info.c_str(),
+                          static_cast<int>(packet->info.size()), SQLITE_STATIC);
         // file_offset 为累计偏移，可超过 4GB，用 64 位绑定避免截断
         sqlite3_bind_int64(stmt, 15, static_cast<sqlite3_int64>(packet->file_offset));
 
@@ -476,15 +502,13 @@ bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
             break;
         }
 
-        sqlite3_reset(stmt); // 重置语句以便下一次绑定
+        sqlite3_reset(stmt);
     }
 
-    // 释放语句
     sqlite3_finalize(stmt);
 
     if (!hasError)
     {
-        // 结束事务
         if (sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK)
         {
             LOG_F(ERROR, "Failed to commit transaction: %s", sqlite3_errmsg(db));
@@ -493,7 +517,6 @@ bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
     }
     else
     {
-        // 如果有错误，回滚事务
         sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
     }
 
@@ -535,14 +558,25 @@ std::shared_ptr<Packet> rowToPacket(sqlite3_stmt* stmt)
 }
 } // namespace
 
-bool SQLiteUtil::queryPacket(std::vector<std::shared_ptr<Packet>>& packetList)
+bool SQLiteUtil::queryPacket(std::vector<std::shared_ptr<Packet>>& packetList, int limit, int offset)
 {
     sqlite3_stmt* stmt = nullptr;
-    std::string   sql  = "select * from t_packets";
+    std::string   sql  = "SELECT * FROM t_packets";
+    if (limit >= 0)
+    {
+        // 分页：按帧号升序保证翻页稳定；LIMIT/OFFSET 用占位符绑定，避免拼接。
+        sql += " ORDER BY frame_number ASC LIMIT ? OFFSET ?";
+    }
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
     {
-        LOG_F(ERROR, "Failed to prepare statement: ");
+        LOG_F(ERROR, "Failed to prepare statement: %s", sqlite3_errmsg(db));
         return false;
+    }
+
+    if (limit >= 0)
+    {
+        sqlite3_bind_int(stmt, 1, limit);
+        sqlite3_bind_int(stmt, 2, offset);
     }
 
     while (sqlite3_step(stmt) == SQLITE_ROW)
@@ -616,7 +650,6 @@ std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>
         }
     }
 
-    // sql += " ORDER BY frame_number ASC LIMIT 1000"; // 限制返回结果数量
     return sql;
 }
 
