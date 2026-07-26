@@ -60,7 +60,9 @@ mkdir -p "${BUILD_DIR}"
 # 进入构建目录并执行CMake和Make
 cd "${BUILD_DIR}"
 echo "configure project..."
-cmake ..
+# CMake ≥ 4.0 会拒绝 vendored GLFW / googletest 里低于 3.5 的 cmake_minimum_required，
+# 加 -DCMAKE_POLICY_VERSION_MINIMUM=3.5 兼容之；旧版 CMake 忽略该变量，无副作用。
+cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 
 echo "compile project..."
 make

@@ -1,5 +1,20 @@
 # 忽略文件夹内容
 build/
+build_win/
 output/data/*
 output/logs/*
 test_data/*
+
+# 构建产物（可执行文件），不纳入版本控制；output/resources 仍保留跟踪
+output/tshark_main
+output/unit_tests
+output/tshark_gui
+output/*.exe
+
+# 运行时产物：GUI 布局、日志、抓包输出，均为本地运行生成，不纳入版本控制
+imgui.ini
+logs/
+data/
+
+# 设计/构建文档，仅本地保留，不纳入版本控制
+docs/

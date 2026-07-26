@@ -2,15 +2,15 @@
 #include <chrono>
 #include <ctime>
 #include <fstream>
-#include <iconv.h>
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
 
-#include "loguru.hpp"
+#include "loguru/loguru.hpp"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
@@ -104,142 +104,90 @@ std::unordered_map<std::string, std::string> translationMap = {
     {"Hypertext Transfer Protocol", "超文本传输协议HTTP"},
     {"Transport Layer Security", "传输层安全协议TLS"}};
 
-// 创建map版本的translationMap2，内容与translationMap相同
-std::map<std::string, std::string> translationMap2 = {
-    {"General information", "常规信息"},
-    {"Frame Number", "帧编号"},
-    {"Captured Length", "捕获长度"},
-    {"Captured Time", "捕获时间"},
-    {"Section number", "节号"},
-    {"Interface id", "接口 id"},
-    {"Interface name", "接口名称"},
-    {"Encapsulation type", "封装类型"},
-    {"Arrival Time", "到达时间"},
-    {"UTC Arrival Time", "UTC到达时间"},
-    {"Epoch Arrival Time", "纪元到达时间"},
-    {"Time shift for this packet", "该数据包的时间偏移"},
-    {"Time delta from previous captured frame", "与上一个捕获帧的时间差"},
-    {"Time delta from previous displayed frame", "与上一个显示帧的时间差"},
-    {"Time since reference or first frame", "自参考帧或第一帧以来的时间"},
-    {"Frame Number", "帧编号"},
-    {"Frame Length", "帧长度"},
-    {"Capture Length", "捕获长度"},
-    {"Frame is marked", "帧标记"},
-    {"Frame is ignored", "帧忽略"},
-    {"Frame", "帧"},
-    {"Protocols in frame", "帧中的协议"},
-    {"Ethernet II", "以太网 II"},
-    {"Destination", "目的地址"},
-    {"Address Resolution Protocol", "ARP地址解析地址"},
-    {"Address (resolved)", "地址（解析后）"},
-    {"Type", "类型"},
-    {"Stream index", "流索引"},
-    {"Internet Protocol Version 4", "互联网协议版本 4"},
-    {"Internet Protocol Version 6", "互联网协议版本 6"},
-    {"Internet Control Message Protocol", "互联网控制消息协议ICMP"},
-    {"Version", "版本"},
-    {"Header Length", "头部长度"},
-    {"Differentiated Services Field", "差分服务字段"},
-    {"Total Length", "总长度"},
-    {"Identification", "标识符"},
-    {"Flags", "标志"},
-    {"Time to Live", "生存时间"},
-    {"Transmission Control Protocol", "TCP传输控制协议"},
-    {"User Datagram Protocol", "UDP用户数据包协议"},
-    {"Domain Name System", "DNS域名解析系统"},
-    {"Header Checksum", "头部校验和"},
-    {"Header checksum status", "校验和状态"},
-    {"Source Address", "源地址"},
-    {"Destination Address", "目的地址"},
-    {"Source Port", "源端口"},
-    {"Destination Port", "目的端口"},
-    {"Next Sequence Number", "下一个序列号"},
-    {"Sequence Number", "序列号"},
-    {"Acknowledgment Number", "确认号"},
-    {"Acknowledgment number", "确认号"},
-    {"TCP Segment Len", "TCP段长度"},
-    {"Conversation completeness", "会话完整性"},
-    {"Window size scaling factor", "窗口缩放因子"},
-    {"Calculated window size", "计算窗口大小"},
-    {"Window", "窗口"},
-    {"Urgent Pointer", "紧急指针"},
-    {"Checksum:", "校验和:"},
-    {"TCP Option - Maximum segment size", "TCP选项 - 最大段大小"},
-    {"Kind", "种类"},
-    {"MSS Value", "MSS值"},
-    {"TCP Option - Window scale", "TCP选项 - 窗口缩放"},
-    {"Shift count", "移位计数"},
-    {"Multiplier", "倍数"},
-    {"TCP Option - Timestamps", "TCP选项 - 时间戳"},
-    {"TCP Option - SACK permitted", "TCP选项 - SACK 允许"},
-    {"TCP Option - End of Option List", "TCP选项 - 选项列表结束"},
-    {"Options", "选项"},
-    {"TCP Option - No-Operation", "TCP选项 - 无操作"},
-    {"Timestamps", "时间戳"},
-    {"Time since first frame in this TCP stream", "自第一帧以来的时间"},
-    {"Time since previous frame in this TCP stream", "与上一个帧的时间差"},
-    {"Protocol:", "协议:"},
-    {"Source:", "源地址:"},
-    {"Length:", "长度:"},
-    {"Checksum status", "校验和状态"},
-    {"Checksum Status", "校验和状态"},
-    {"TCP payload", "TCP载荷"},
-    {"UDP payload", "UDP载荷"},
-    {"Hypertext Transfer Protocol", "超文本传输协议HTTP"},
-    {"Transport Layer Security", "传输层安全协议TLS"}};
-
 std::shared_ptr<xdb_search_t> IP2RegionUtil::xdbPtr;
 
 std::string IP2RegionUtil::getIpLocation(const std::string& ip)
 {
+    // 取一份局部引用，避免与 init() 的发布竞争；未初始化（或初始化失败）直接返回空。
+    std::shared_ptr<xdb_search_t> xdb = xdbPtr;
+    if (!xdb)
+    {
+        return "";
+    }
 
-    // if is IPv6, return empty string
+    // IPv4 文本最长 15 字符（xxx.xxx.xxx.xxx），更长即视为 IPv6；ip2region 仅支持 IPv4。
     if (ip.size() > 15)
     {
         return "";
     }
 
-    std::string location = xdbPtr->search(ip);
-    if (!location.empty() && location.find("invalid") == std::string::npos)
+    // 记忆化：真实流量里少数 IP 贡献了绝大多数报文（工作集小、调用量大），命中缓存即可
+    // 跳过 xdb 二分查找与 parseLocation 的分配。离线分析与抓包线程可能并发调用，用一把
+    // 静态 mutex 守护；未命中时的锁开销远小于一次查表+解析，命中时几乎零成本。
+    static std::unordered_map<std::string, std::string> locationCache;
+    static std::mutex                                    cacheMutex;
     {
-        return parseLocation(location);
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto                        it = locationCache.find(ip);
+        if (it != locationCache.end())
+        {
+            return it->second;
+        }
     }
-    else
+
+    std::string location;
+    std::string raw = xdb->search(ip);
+    if (!raw.empty() && raw.find("invalid") == std::string::npos)
     {
-        return "";
+        location = parseLocation(raw);
     }
+    // 连空结果（无效/查不到）也缓存，避免同一个坏 IP 反复触发查表。
+
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        locationCache.emplace(ip, location);
+    }
+    return location;
 }
 
 std::string IP2RegionUtil::parseLocation(const std::string& input)
 {
-    std::vector<std::string> tokens;
-    std::string              token;
-    std::stringstream        ss(input);
-
     if (input.find("内网") != std::string::npos)
     {
         return "内网";
     }
 
-    while (std::getline(ss, token, '|'))
+    // 按 '|' 切分为「国家|区域|省份|城市|ISP」5 段。手动扫描按需 substr，
+    // 避免 std::stringstream + getline 每次调用都构造流对象、逐字符搬运的额外开销。
+    std::string tokens[5];
+    int         count = 0;
+    size_t      start = 0;
+    while (count < 5)
     {
-        tokens.push_back(token);
+        size_t pos = input.find('|', start);
+        if (pos == std::string::npos)
+        {
+            tokens[count++] = input.substr(start);
+            break;
+        }
+        tokens[count++] = input.substr(start, pos - start);
+        start           = pos + 1;
     }
 
-    if (tokens.size() >= 4)
+    if (count >= 4)
     {
         std::string result;
-        if (tokens[0].compare("0") != 0)
+        if (tokens[0] != "0")
         {
             result.append(tokens[0]);
         }
-        if (tokens[2].compare("0") != 0)
+        if (tokens[2] != "0")
         {
-            result.append("-" + tokens[2]);
+            result.append("-").append(tokens[2]);
         }
-        if (tokens[3].compare("0") != 0)
+        if (tokens[3] != "0")
         {
-            result.append("-" + tokens[3]);
+            result.append("-").append(tokens[3]);
         }
 
         return result;
@@ -252,35 +200,28 @@ std::string IP2RegionUtil::parseLocation(const std::string& input)
 
 bool IP2RegionUtil::init(const std::string& xdbFilePath)
 {
-
-    xdbPtr = std::make_shared<xdb_search_t>(xdbFilePath);
-    xdbPtr->init_content();
-    return true;
-}
-
-std::string CommonUtil::UTF8ToANSIString(const std::string& utf8Str)
-{
-    if (utf8Str.empty())
-        return "";
-
-    iconv_t cd = iconv_open("ANSI", "UTF-8");
-    if (cd == (iconv_t)-1)
-        return "";
-
-    size_t            inBytesLeft  = utf8Str.size();
-    size_t            outBytesLeft = utf8Str.size() * 2;
-    std::vector<char> outBuf(outBytesLeft);
-    char*             inBuf     = const_cast<char*>(utf8Str.c_str());
-    char*             outBufPtr = outBuf.data();
-
-    if (iconv(cd, &inBuf, &inBytesLeft, &outBufPtr, &outBytesLeft) == (size_t)-1)
-    {
-        iconv_close(cd);
-        return "";
-    }
-
-    iconv_close(cd);
-    return std::string(outBuf.begin(), outBuf.begin() + (outBuf.size() - outBytesLeft));
+    // 只初始化一次：xdb 文件较大，且离线分析线程与抓包线程都会调用 init，
+    // 用 call_once 保证仅加载一次，既避免每次分析重复加载，也消除并发重设
+    // 静态 xdbPtr 的数据竞争。call_once 完成对所有调用线程建立 happens-before，
+    // 之后各线程读 xdbPtr 都是安全的。加载失败时把 xdbPtr 置空并返回 false，
+    // 绝不让异常沿离线分析路径冒泡到 UI 线程。
+    static std::once_flag initFlag;
+    std::call_once(initFlag,
+                   [&xdbFilePath]()
+                   {
+                       try
+                       {
+                           std::shared_ptr<xdb_search_t> p =
+                               std::make_shared<xdb_search_t>(xdbFilePath);
+                           p->init_content();
+                           xdbPtr = p;
+                       }
+                       catch (...)
+                       {
+                           xdbPtr = nullptr;
+                       }
+                   });
+    return xdbPtr != nullptr;
 }
 
 std::string CommonUtil::get_timestamp()
@@ -289,13 +230,111 @@ std::string CommonUtil::get_timestamp()
     auto now_time = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
+    // std::localtime 返回指向共享静态缓冲区的指针，并发调用会相互覆盖（数据竞争）。
+    // 改用可重入版本写入线程内的 tm：POSIX 用 localtime_r，Windows 用 localtime_s。
+    std::tm tm_buf{};
+#if defined(_WIN32)
+    localtime_s(&tm_buf, &now_time);
+#else
+    localtime_r(&now_time, &tm_buf);
+#endif
+
     std::stringstream ss;
-    ss << std::put_time(std::localtime(&now_time), "%Y%m%d%H%M%S");
+    ss << std::put_time(&tm_buf, "%Y%m%d%H%M%S");
     ss << std::setfill('0') << std::setw(3) << ms.count();
 
     return ss.str();
 }
 
+
+namespace
+{
+// 前缀树（trie）：把翻译词典按字符逐层展开成一棵树，用于在 O(待匹配串长度) 内
+// 找出 showname 的“最长匹配前缀”。
+//
+// 原实现对约 80 条词典逐条做 showname.find(key) == 0：
+//   - find 会在整串中查找 key，实为 O(串长 × 词典大小) 的重复扫描；
+//   - 遍历的是 unordered_map，命中顺序不确定，多个前缀都能匹配时结果不稳定。
+// 改用 trie 后：只需顺着 showname 走一遍，且总是选中最长（最具体）的前缀，结果确定。
+class TranslationTrie
+{
+public:
+    void insert(const std::string& key, const std::string& value)
+    {
+        Node* cur = &root_;
+        for (char ch : key)
+        {
+            std::unique_ptr<Node>& child = cur->children[ch];
+            if (!child)
+            {
+                child.reset(new Node());
+            }
+            cur = child.get();
+        }
+        cur->hasValue = true;
+        cur->value    = value;
+    }
+
+    // 命中时返回最长匹配前缀的译文，并通过 matchedLen 返回该前缀长度；无匹配返回 nullptr
+    const std::string* matchLongestPrefix(const std::string& text, size_t& matchedLen) const
+    {
+        const Node*        cur  = &root_;
+        const std::string* best = nullptr;
+        matchedLen              = 0;
+        for (size_t i = 0; i < text.size(); ++i)
+        {
+            auto it = cur->children.find(text[i]);
+            if (it == cur->children.end())
+            {
+                break; // 无法继续沿树下探，停止
+            }
+            cur = it->second.get();
+            if (cur->hasValue)
+            {
+                best       = &cur->value; // 记录当前更长的匹配，继续尝试更长的
+                matchedLen = i + 1;
+            }
+        }
+        return best;
+    }
+
+private:
+    struct Node
+    {
+        std::map<char, std::unique_ptr<Node>> children;
+        bool                                  hasValue = false;
+        std::string                           value;
+    };
+    Node root_;
+};
+
+// 由 translationMap 惰性构建一次（C++11 保证 static 局部变量初始化线程安全），之后只读复用。
+const TranslationTrie& translationTrie()
+{
+    static const TranslationTrie trie = [] {
+        TranslationTrie t;
+        for (const auto& pair : translationMap)
+        {
+            t.insert(pair.first, pair.second);
+        }
+        return t;
+    }();
+    return trie;
+}
+
+// 对 showname 做最长前缀翻译；命中则替换前缀并返回 true
+bool translatePrefix(std::string& showname)
+{
+    size_t             matchedLen  = 0;
+    const std::string* translation = translationTrie().matchLongestPrefix(showname, matchedLen);
+    if (translation)
+    {
+        showname.replace(0, matchedLen, *translation);
+        return true;
+    }
+    return false;
+}
+} // namespace
 
 void CommonUtil::translateShowNameFields(rapidjson::Value&                   value,
                                          rapidjson::Document::AllocatorType& allocator)
@@ -305,39 +344,20 @@ void CommonUtil::translateShowNameFields(rapidjson::Value&                   val
         if (value.HasMember("showname") && value["showname"].IsString())
         {
             std::string showname = value["showname"].GetString();
-
-            for (const auto& pair : translationMap)
+            if (translatePrefix(showname))
             {
-                const std::string& key         = pair.first;
-                const std::string& translation = pair.second;
-
-                if (showname.find(key) == 0)
-                {
-                    showname.replace(0, key.length(), translation);
-                    value["showname"].SetString(showname.c_str(), allocator);
-                    break;
-                }
+                value["showname"].SetString(showname.c_str(), allocator);
             }
         }
         else if (value.HasMember("show") && value["show"].IsString())
         {
             std::string showname = value["show"].GetString();
-
-            for (const auto& pair : translationMap)
+            if (translatePrefix(showname))
             {
-                const std::string& key         = pair.first;
-                const std::string& translation = pair.second;
-
-                if (showname.find(key) == 0)
-                {
-                    showname.replace(0, key.length(), translation);
-                    value["show"].SetString(showname.c_str(), allocator);
-                    break;
-                }
+                value["show"].SetString(showname.c_str(), allocator);
             }
         }
 
-        // 有 "field" 字段，递归处理
         if (value.HasMember("field") && value["field"].IsArray())
         {
             rapidjson::Value& fieldArray = value["field"];
@@ -356,70 +376,8 @@ void CommonUtil::translateShowNameFields(rapidjson::Value&                   val
     }
 }
 
-// 性能对比函数实现
-void CommonUtil::compareMapPerformance(int iterations)
-{
-    try
-    {
-        std::string key = "Interface id";
-
-        // unordered_map
-        std::string result;
-        auto        start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < iterations; ++i)
-        {
-            auto it = translationMap.find(key);
-            if (it != translationMap.end())
-            {
-                result = it->second;
-            }
-        }
-        auto end = std::chrono::high_resolution_clock::now();
-        auto unordered_duration =
-            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
-        // map
-        start = std::chrono::high_resolution_clock::now();
-        for (int i = 0; i < iterations; ++i)
-        {
-            auto it = translationMap2.find(key);
-            if (it != translationMap2.end())
-            {
-                result = it->second;
-            }
-        }
-        end = std::chrono::high_resolution_clock::now();
-        auto map_duration =
-            std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-
-        std::cout << "unordered_map 查询" << iterations << "次耗时: " << unordered_duration << " us"
-                  << std::endl;
-        std::cout << "map 查询" << iterations << "次耗时: " << map_duration << " us" << std::endl;
-
-        if (unordered_duration > 0)
-        {
-            std::cout << "对比结果: unordered_map是map的"
-                      << static_cast<double>(map_duration) / unordered_duration << "倍速度"
-                      << std::endl;
-        }
-        else
-        {
-            std::cout << "无法计算性能比较，unordered_map耗时为0" << std::endl;
-        }
-    }
-    catch (const std::exception& e)
-    {
-        std::cerr << "性能比较过程中发生异常: " << e.what() << std::endl;
-    }
-    catch (...)
-    {
-        std::cerr << "性能比较过程中发生未知异常" << std::endl;
-    }
-}
-
 SQLiteUtil::SQLiteUtil(const std::string& dbname)
 {
-    // 打开数据库连接
     int rc = sqlite3_open(dbname.c_str(), &db);
     if (rc != SQLITE_OK)
     {
@@ -427,6 +385,17 @@ SQLiteUtil::SQLiteUtil(const std::string& dbname)
         sqlite3_close(db);
         throw std::runtime_error("Failed to open database");
     }
+
+    // 性能取舍：这个库是可从 pcap 随时重建的「派生缓存」，不需要为掉电持久化付出
+    // 每次 COMMIT 都 fsync 回滚日志 + 数据文件的代价。fsync 是把数据强制刷到物理盘的
+    // 屏障，会让入库流水线卡在磁盘 I/O 上；实时抓包多批次入库时这笔开销尤其明显。
+    //   - journal_mode=MEMORY：回滚日志放内存，省去日志文件的创建与 fsync；
+    //   - synchronous=OFF：COMMIT 不再 fsync（掉电可能损坏，但源头 pcap 仍在，可重建）；
+    //   - temp_store=MEMORY：临时表/索引走内存。
+    // 这些 PRAGMA 失败只会退化回更慢但同样正确的默认行为，不影响功能，故不因此中断构造。
+    sqlite3_exec(db, "PRAGMA journal_mode = MEMORY;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA synchronous = OFF;", nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", nullptr, nullptr, nullptr);
 }
 
 SQLiteUtil::~SQLiteUtil()
@@ -440,7 +409,6 @@ SQLiteUtil::~SQLiteUtil()
 
 bool SQLiteUtil::createPacketTable()
 {
-    // 检查表是否存在，若不存在则创建
     std::string createTableSQL = R"(
         CREATE TABLE IF NOT EXISTS t_packets (
             frame_number INTEGER PRIMARY KEY,
@@ -478,11 +446,9 @@ bool SQLiteUtil::createPacketTable()
 
 bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
 {
-    // 实现插入数据的逻辑
-    // 开启事务
+    // 单事务批量插入：整批要么全部提交，出错则整体回滚。
     sqlite3_exec(db, "BEGIN TRANSACTION;", nullptr, nullptr, nullptr);
 
-    // SQL 插入语句
     std::string insertSQL = R"(
         INSERT INTO t_packets (
             frame_number, time, cap_len, len, src_mac, dst_mac, src_ip, src_location, src_port,
@@ -497,25 +463,37 @@ bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
         return false;
     }
 
-    // 遍历列表并插入数据
     bool hasError = false;
     for (const auto& packet : packets)
     {
+        // 绑定文本列时传入显式字节长度（.size()）而非 -1：-1 会让 SQLite 对每个
+        // 字符串各做一次 strlen 扫描，批量插入 N 包 × 8 列即 8N 次全串扫描。std::string
+        // 已知长度，直接给出可省去这些扫描；SQLITE_STATIC 表示不拷贝，字符串由 packet
+        // 在本次事务结束前持有，保证有效。
         sqlite3_bind_int(stmt, 1, packet->frame_number);
         sqlite3_bind_double(stmt, 2, packet->time);
         sqlite3_bind_int(stmt, 3, packet->cap_len);
         sqlite3_bind_int(stmt, 4, packet->len);
-        sqlite3_bind_text(stmt, 5, packet->src_mac.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 6, packet->dst_mac.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 7, packet->src_ip.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 8, packet->src_location.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 5, packet->src_mac.c_str(),
+                          static_cast<int>(packet->src_mac.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 6, packet->dst_mac.c_str(),
+                          static_cast<int>(packet->dst_mac.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 7, packet->src_ip.c_str(),
+                          static_cast<int>(packet->src_ip.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 8, packet->src_location.c_str(),
+                          static_cast<int>(packet->src_location.size()), SQLITE_STATIC);
         sqlite3_bind_int(stmt, 9, packet->src_port);
-        sqlite3_bind_text(stmt, 10, packet->dst_ip.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 11, packet->dst_location.c_str(), -1, SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 10, packet->dst_ip.c_str(),
+                          static_cast<int>(packet->dst_ip.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 11, packet->dst_location.c_str(),
+                          static_cast<int>(packet->dst_location.size()), SQLITE_STATIC);
         sqlite3_bind_int(stmt, 12, packet->dst_port);
-        sqlite3_bind_text(stmt, 13, packet->protocol.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_text(stmt, 14, packet->info.c_str(), -1, SQLITE_STATIC);
-        sqlite3_bind_int(stmt, 15, packet->file_offset);
+        sqlite3_bind_text(stmt, 13, packet->protocol.c_str(),
+                          static_cast<int>(packet->protocol.size()), SQLITE_STATIC);
+        sqlite3_bind_text(stmt, 14, packet->info.c_str(),
+                          static_cast<int>(packet->info.size()), SQLITE_STATIC);
+        // file_offset 为累计偏移，可超过 4GB，用 64 位绑定避免截断
+        sqlite3_bind_int64(stmt, 15, static_cast<sqlite3_int64>(packet->file_offset));
 
         if (sqlite3_step(stmt) != SQLITE_DONE)
         {
@@ -524,15 +502,13 @@ bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
             break;
         }
 
-        sqlite3_reset(stmt); // 重置语句以便下一次绑定
+        sqlite3_reset(stmt);
     }
 
-    // 释放语句
     sqlite3_finalize(stmt);
 
     if (!hasError)
     {
-        // 结束事务
         if (sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK)
         {
             LOG_F(ERROR, "Failed to commit transaction: %s", sqlite3_errmsg(db));
@@ -541,42 +517,71 @@ bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
     }
     else
     {
-        // 如果有错误，回滚事务
         sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
     }
 
     return !hasError;
 }
 
-bool SQLiteUtil::queryPacket(std::vector<std::shared_ptr<Packet>>& packetList)
+namespace
 {
-    sqlite3_stmt *stmt = nullptr, *countStmt = nullptr;
-    std::string   sql = "select * from t_packets";
+// sqlite3_column_text 对 NULL 列返回 nullptr，直接拿来构造 std::string 是未定义行为。
+// 统一经此 helper 读取文本列：NULL 一律按空串处理。
+std::string columnText(sqlite3_stmt* stmt, int col)
+{
+    const unsigned char* text = sqlite3_column_text(stmt, col);
+    return text ? reinterpret_cast<const char*>(text) : std::string();
+}
+
+// 把 t_packets 的一行读进 Packet：queryPacket / queryPackets 共用同一列序，
+// 抽出来消除两处几乎重复的读列逻辑，并统一走 NULL 安全的 columnText。
+std::shared_ptr<Packet> rowToPacket(sqlite3_stmt* stmt)
+{
+    std::shared_ptr<Packet> packet = std::make_shared<Packet>();
+    packet->frame_number           = sqlite3_column_int(stmt, 0);
+    packet->time                   = sqlite3_column_double(stmt, 1);
+    packet->cap_len                = sqlite3_column_int(stmt, 2);
+    packet->len                    = sqlite3_column_int(stmt, 3);
+    packet->src_mac                = columnText(stmt, 4);
+    packet->dst_mac                = columnText(stmt, 5);
+    packet->src_ip                 = columnText(stmt, 6);
+    packet->src_location           = columnText(stmt, 7);
+    packet->src_port               = sqlite3_column_int(stmt, 8);
+    packet->dst_ip                 = columnText(stmt, 9);
+    packet->dst_location           = columnText(stmt, 10);
+    packet->dst_port               = sqlite3_column_int(stmt, 11);
+    packet->protocol               = columnText(stmt, 12);
+    packet->info                   = columnText(stmt, 13);
+    // file_offset 为累计偏移，可超过 4GB，用 64 位列读取
+    packet->file_offset = static_cast<uint64_t>(sqlite3_column_int64(stmt, 14));
+    return packet;
+}
+} // namespace
+
+bool SQLiteUtil::queryPacket(std::vector<std::shared_ptr<Packet>>& packetList, int limit, int offset)
+{
+    sqlite3_stmt* stmt = nullptr;
+    std::string   sql  = "SELECT * FROM t_packets";
+    if (limit >= 0)
+    {
+        // 分页：按帧号升序保证翻页稳定；LIMIT/OFFSET 用占位符绑定，避免拼接。
+        sql += " ORDER BY frame_number ASC LIMIT ? OFFSET ?";
+    }
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
     {
-        LOG_F(ERROR, "Failed to prepare statement: ");
+        LOG_F(ERROR, "Failed to prepare statement: %s", sqlite3_errmsg(db));
         return false;
+    }
+
+    if (limit >= 0)
+    {
+        sqlite3_bind_int(stmt, 1, limit);
+        sqlite3_bind_int(stmt, 2, offset);
     }
 
     while (sqlite3_step(stmt) == SQLITE_ROW)
     {
-        std::shared_ptr<Packet> packet = std::make_shared<Packet>();
-        packet->frame_number           = sqlite3_column_int(stmt, 0);
-        packet->time                   = sqlite3_column_double(stmt, 1);
-        packet->cap_len                = sqlite3_column_int(stmt, 2);
-        packet->len                    = sqlite3_column_int(stmt, 3);
-        packet->src_mac      = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-        packet->dst_mac      = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
-        packet->src_ip       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
-        packet->src_location = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
-        packet->src_port     = sqlite3_column_int(stmt, 8);
-        packet->dst_ip       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
-        packet->dst_location = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
-        packet->dst_port     = sqlite3_column_int(stmt, 11);
-        packet->protocol     = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 12));
-        packet->info         = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 13));
-        packet->file_offset  = sqlite3_column_int(stmt, 14);
-        packetList.push_back(packet);
+        packetList.push_back(rowToPacket(stmt));
     }
 
     sqlite3_finalize(stmt);
@@ -584,8 +589,10 @@ bool SQLiteUtil::queryPacket(std::vector<std::shared_ptr<Packet>>& packetList)
     return true;
 }
 
-std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>& conditions)
+std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>& conditions,
+                                        std::vector<BindParam>&                   params)
 {
+    params.clear();
     std::string sql = "SELECT * FROM t_packets WHERE 1=1";
 
     for (const auto& condition : conditions)
@@ -594,44 +601,55 @@ std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>
         {
             std::string pattern = condition.second;
             std::replace(pattern.begin(), pattern.end(), '*', '%');
-            sql += " AND (src_mac LIKE '" + pattern + "' OR dst_mac LIKE '" + pattern + "')";
+            // 用 ? 占位、两个源/目的字段各绑定一次，用户输入不进入 SQL 文本
+            sql += " AND (src_mac LIKE ? OR dst_mac LIKE ?)";
+            params.push_back({BindParam::Text, pattern, 0});
+            params.push_back({BindParam::Text, pattern, 0});
         }
         else if (condition.first == "ip_address")
         {
             std::string pattern = condition.second;
             std::replace(pattern.begin(), pattern.end(), '*', '%');
-            sql += " AND (src_ip LIKE '" + pattern + "' OR dst_ip LIKE '" + pattern + "')";
+            sql += " AND (src_ip LIKE ? OR dst_ip LIKE ?)";
+            params.push_back({BindParam::Text, pattern, 0});
+            params.push_back({BindParam::Text, pattern, 0});
         }
         else if (condition.first == "port")
         {
             std::string pattern = condition.second;
             std::replace(pattern.begin(), pattern.end(), '*', '%');
-            // 将字符串转换为数字进行比较
-            if (pattern.find('%') == std::string::npos)
+            // 纯数字则按整数精确匹配，否则按文本模糊匹配（避免 stoi 抛异常）
+            bool numeric = !pattern.empty() &&
+                           pattern.find('%') == std::string::npos &&
+                           pattern.find_first_not_of("0123456789") == std::string::npos;
+            if (numeric)
             {
-                sql += " AND (src_port = " + pattern + " OR dst_port = " + pattern + ")";
+                int portValue = std::stoi(pattern);
+                sql += " AND (src_port = ? OR dst_port = ?)";
+                params.push_back({BindParam::Int, "", portValue});
+                params.push_back({BindParam::Int, "", portValue});
             }
             else
             {
-                sql += " AND (CAST(src_port AS TEXT) LIKE '" + pattern +
-                       "' OR CAST(dst_port AS TEXT) LIKE '" + pattern + "')";
+                sql += " AND (CAST(src_port AS TEXT) LIKE ? OR CAST(dst_port AS TEXT) LIKE ?)";
+                params.push_back({BindParam::Text, pattern, 0});
+                params.push_back({BindParam::Text, pattern, 0});
             }
         }
         else if (condition.first == "location")
         {
             std::string pattern = condition.second;
             std::replace(pattern.begin(), pattern.end(), '*', '%');
-            // pattern前后都添加%，实现任意位置匹配
-            if (pattern.find('%') == std::string::npos)
-            {
-                pattern = "%" + pattern + "%";
-            }
-            sql +=
-                " AND (src_location LIKE '" + pattern + "' OR dst_location LIKE '" + pattern + "')";
+            // 地理位置一律做任意位置的子串匹配：无条件在前后各加一个 %。
+            // 即使用户输入本身已含 *（如 "湖南*长沙"→"湖南%长沙"），也要补成
+            // "%湖南%长沙%" 才能匹配 "中国-湖南省-长沙市"；多余的 %% 等价单个 %，无害。
+            pattern = "%" + pattern + "%";
+            sql += " AND (src_location LIKE ? OR dst_location LIKE ?)";
+            params.push_back({BindParam::Text, pattern, 0});
+            params.push_back({BindParam::Text, pattern, 0});
         }
     }
 
-    // sql += " ORDER BY frame_number ASC LIMIT 1000"; // 限制返回结果数量
     return sql;
 }
 
@@ -644,33 +662,32 @@ std::string SQLiteUtil::packetsToJson(std::vector<std::shared_ptr<Packet>>& pack
     document.AddMember("total", rapidjson::Value((int)packets.size()), allocator);
 
     rapidjson::Value packetsArray(rapidjson::kArrayType);
+    packetsArray.Reserve(static_cast<rapidjson::SizeType>(packets.size()), allocator);
 
     for (const auto& packet : packets)
     {
         rapidjson::Value packetObj(rapidjson::kObjectType);
 
+        // 字符串字段使用StringRef引用Packet中已有的内存，避免把每个字符串再拷贝进allocator。
+        // packet在本函数序列化完成前始终存活，不会悬垂。
         packetObj.AddMember("frame_number", rapidjson::Value(packet->frame_number), allocator);
         packetObj.AddMember("time", rapidjson::Value(packet->time), allocator);
         packetObj.AddMember("cap_len", rapidjson::Value(packet->cap_len), allocator);
         packetObj.AddMember("len", rapidjson::Value(packet->len), allocator);
-        packetObj.AddMember("src_mac", rapidjson::Value(packet->src_mac.c_str(), allocator),
+        packetObj.AddMember("src_mac", rapidjson::StringRef(packet->src_mac.c_str()), allocator);
+        packetObj.AddMember("dst_mac", rapidjson::StringRef(packet->dst_mac.c_str()), allocator);
+        packetObj.AddMember("src_ip", rapidjson::StringRef(packet->src_ip.c_str()), allocator);
+        packetObj.AddMember("src_location", rapidjson::StringRef(packet->src_location.c_str()),
                             allocator);
-        packetObj.AddMember("dst_mac", rapidjson::Value(packet->dst_mac.c_str(), allocator),
-                            allocator);
-        packetObj.AddMember("src_ip", rapidjson::Value(packet->src_ip.c_str(), allocator),
-                            allocator);
-        packetObj.AddMember("src_location",
-                            rapidjson::Value(packet->src_location.c_str(), allocator), allocator);
         packetObj.AddMember("src_port", rapidjson::Value(packet->src_port), allocator);
-        packetObj.AddMember("dst_ip", rapidjson::Value(packet->dst_ip.c_str(), allocator),
+        packetObj.AddMember("dst_ip", rapidjson::StringRef(packet->dst_ip.c_str()), allocator);
+        packetObj.AddMember("dst_location", rapidjson::StringRef(packet->dst_location.c_str()),
                             allocator);
-        packetObj.AddMember("dst_location",
-                            rapidjson::Value(packet->dst_location.c_str(), allocator), allocator);
         packetObj.AddMember("dst_port", rapidjson::Value(packet->dst_port), allocator);
-        packetObj.AddMember("protocol", rapidjson::Value(packet->protocol.c_str(), allocator),
-                            allocator);
-        packetObj.AddMember("info", rapidjson::Value(packet->info.c_str(), allocator), allocator);
-        packetObj.AddMember("file_offset", rapidjson::Value(packet->file_offset), allocator);
+        packetObj.AddMember("protocol", rapidjson::StringRef(packet->protocol.c_str()), allocator);
+        packetObj.AddMember("info", rapidjson::StringRef(packet->info.c_str()), allocator);
+        packetObj.AddMember("file_offset",
+                            rapidjson::Value(static_cast<uint64_t>(packet->file_offset)), allocator);
 
         packetsArray.PushBack(packetObj, allocator);
     }
@@ -687,7 +704,8 @@ std::string SQLiteUtil::packetsToJson(std::vector<std::shared_ptr<Packet>>& pack
 bool SQLiteUtil::queryPackets(const std::map<std::string, std::string>& conditions,
                               std::string&                              jsonResult)
 {
-    std::string sql = buildFuzzyQuery(conditions);
+    std::vector<BindParam> params;
+    std::string            sql = buildFuzzyQuery(conditions, params);
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
@@ -696,26 +714,32 @@ bool SQLiteUtil::queryPackets(const std::map<std::string, std::string>& conditio
         return false;
     }
 
+    // 按顺序绑定参数（sqlite3 占位符索引从 1 开始）
+    for (size_t i = 0; i < params.size(); ++i)
+    {
+        int idx = static_cast<int>(i) + 1;
+        int rc;
+        if (params[i].type == BindParam::Int)
+        {
+            rc = sqlite3_bind_int(stmt, idx, params[i].intValue);
+        }
+        else
+        {
+            // SQLITE_TRANSIENT：让 sqlite 复制字符串，params 生命周期结束后也安全
+            rc = sqlite3_bind_text(stmt, idx, params[i].text.c_str(), -1, SQLITE_TRANSIENT);
+        }
+        if (rc != SQLITE_OK)
+        {
+            LOG_F(ERROR, "Failed to bind query parameter %d: %s", idx, sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            return false;
+        }
+    }
+
     std::vector<std::shared_ptr<Packet>> packets;
     while (sqlite3_step(stmt) == SQLITE_ROW)
     {
-        std::shared_ptr<Packet> packet = std::make_shared<Packet>();
-        packet->frame_number           = sqlite3_column_int(stmt, 0);
-        packet->time                   = sqlite3_column_double(stmt, 1);
-        packet->cap_len                = sqlite3_column_int(stmt, 2);
-        packet->len                    = sqlite3_column_int(stmt, 3);
-        packet->src_mac      = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 4));
-        packet->dst_mac      = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 5));
-        packet->src_ip       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 6));
-        packet->src_location = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 7));
-        packet->src_port     = sqlite3_column_int(stmt, 8);
-        packet->dst_ip       = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 9));
-        packet->dst_location = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
-        packet->dst_port     = sqlite3_column_int(stmt, 11);
-        packet->protocol     = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 12));
-        packet->info         = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 13));
-        packet->file_offset  = sqlite3_column_int(stmt, 14);
-        packets.push_back(packet);
+        packets.push_back(rowToPacket(stmt));
     }
 
     sqlite3_finalize(stmt);

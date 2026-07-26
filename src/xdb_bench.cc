@@ -1,10 +1,14 @@
 
 #include "ip2region/xdb_bench.h"
 
-#include <arpa/inet.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #include <sys/time.h>
+#endif
 
 #include <iostream>
 #include <vector>
@@ -15,20 +19,28 @@ static void log_exit(const std::string &msg) {
 }
 
 static unsigned long long get_time() {
+#if defined(_WIN32)
+    // Windows 无 gettimeofday：用系统时钟换算到微秒（100ns 单位 / 10）。
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    unsigned long long t =
+        ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    return t / 10;
+#else
     struct timeval tv1;
     gettimeofday(&tv1, NULL);
     return (unsigned long long)tv1.tv_sec * 1000 * 1000 + tv1.tv_usec;
+#endif
 }
 
 static bool ip2uint(const char *buf, unsigned int &ip) {
-    struct in_addr addr;
-    if (inet_pton(AF_INET, buf, &addr) == 0)
+    // 便携解析点分四段，避免依赖 inet_pton / winsock（结果与原实现在小端下一致）。
+    unsigned int a, b, c, d;
+    char         extra;
+    int          n = sscanf(buf, "%u.%u.%u.%u%c", &a, &b, &c, &d, &extra);
+    if (n != 4 || a > 255 || b > 255 || c > 255 || d > 255)
         return false;
-    // 网络字节序为大端存储, 在此转换为小端存储
-    ip = (((addr.s_addr >> 0) & 0xFF) << 24) |
-         (((addr.s_addr >> 8) & 0xFF) << 16) |
-         (((addr.s_addr >> 16) & 0xFF) << 8) |
-         (((addr.s_addr >> 24) & 0xFF) << 0);
+    ip = (a << 24) | (b << 16) | (c << 8) | d;
     return true;
 }
 

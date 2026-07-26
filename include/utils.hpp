@@ -54,25 +54,12 @@ public:
     static std::string get_timestamp();
 
     /**
-     * @brief UTF8字符串转ANSI字符串
-     * @param utf8Str UTF8编码的字符串
-     * @return ANSI编码的字符串
-     */
-    static std::string UTF8ToANSIString(const std::string& utf8Str);
-
-    /**
      * @brief 翻译字段名称
      * @param value rapidjson值对象
      * @param allocator rapidjson分配器
      */
     static void translateShowNameFields(rapidjson::Value&                   value,
                                         rapidjson::Document::AllocatorType& allocator);
-
-    /**
-     * @brief 比较不同Map实现的性能
-     * @param iterations 迭代次数
-     */
-    static void compareMapPerformance(int iterations);
 };
 
 /**
@@ -111,12 +98,18 @@ public:
     bool insertPacket(std::vector<std::shared_ptr<Packet>>& packets);
 
     /**
-     * @brief 查询所有数据包
+     * @brief 查询数据包（可选分页）
      * @param packetList 用于存储查询结果的列表
+     * @param limit 最多返回的行数；<0 表示不分页、返回全部（默认，保持旧行为）
+     * @param offset 跳过的行数，仅在 limit>=0 时生效
      * @return true 查询成功
      * @return false 查询失败
+     *
+     * @note limit>=0 时按 frame_number 升序返回，保证翻页结果稳定；
+     *       大抓包下用分页可避免一次性把全表读进内存造成内存尖峰。
      */
-    bool queryPacket(std::vector<std::shared_ptr<Packet>>& packetList);
+    bool queryPacket(std::vector<std::shared_ptr<Packet>>& packetList, int limit = -1,
+                     int offset = 0);
 
     /**
      * @brief 根据条件查询数据包并返回JSON格式结果
@@ -141,6 +134,23 @@ private:
     sqlite3* db = nullptr;
 
     /**
+     * @brief 参数化查询中的一个绑定值
+     *
+     * SQL 语句中用 `?` 占位，实际值放在这里，执行时通过 sqlite3_bind_* 绑定，
+     * 从根本上避免把用户输入拼进 SQL 文本造成注入。
+     */
+    struct BindParam
+    {
+        enum Type
+        {
+            Text,
+            Int
+        } type;
+        std::string text;     // Type == Text 时有效
+        int         intValue; // Type == Int 时有效
+    };
+
+    /**
      * @brief 将数据包列表转换为JSON格式
      * @param packets 数据包列表
      * @return JSON格式的字符串
@@ -148,11 +158,13 @@ private:
     std::string packetsToJson(std::vector<std::shared_ptr<Packet>>& packets);
 
     /**
-     * @brief 构建模糊查询SQL语句
+     * @brief 构建参数化的模糊查询SQL语句
      * @param conditions 查询条件
-     * @return SQL查询语句
+     * @param params 输出参数，按 `?` 出现顺序收集需要绑定的值
+     * @return 带 `?` 占位符的 SQL 查询语句
      */
-    std::string buildFuzzyQuery(const std::map<std::string, std::string>& conditions);
+    std::string buildFuzzyQuery(const std::map<std::string, std::string>& conditions,
+                                std::vector<BindParam>&                   params);
 };
 
 #endif
