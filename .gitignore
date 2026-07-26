@@ -3,3 +3,13 @@ build/
 output/data/*
 output/logs/*
 test_data/*
+
+# 构建产物（可执行文件），不纳入版本控制；output/resources 仍保留跟踪
+output/tshark_main
+output/unit_tests
+output/tshark_gui
+
+# 运行时产物：GUI 布局、日志、抓包输出，均为本地运行生成，不纳入版本控制
+imgui.ini
+logs/
+data/

@@ -1,24 +1,30 @@
 #include <gtest/gtest.h>
-#include "tsharkManager.hpp"
+#include "PcapAnalyzer.hpp"
+#include "PdmlToJsonConverter.hpp"
+#include "test_fs_util.hpp"
+#include "tsharkCommand.hpp"
 #include "utils.hpp"
+
+using testfs::makeDirs;
 #include <memory>
 #include <fstream>
 #include <cstdio>
 
-// TsharkManager测试夹具
-class TsharkManagerTest : public ::testing::Test {
+// 离线分析测试夹具
+class OfflineAnalysisTest : public ::testing::Test {
 protected:
     void SetUp() override {
         // 确保测试目录存在
-        system("mkdir -p test_data");
+        makeDirs("test_data");
     }
-    
+
     void TearDown() override {
         // 清理代码
     }
-    
+
     // 测试夹具中的共享资源
-    TsharkManager tsharkManager{"./test_output"};
+    PcapAnalyzer        analyzer{TsharkCommand::defaultTsharkPath()};
+    PdmlToJsonConverter converter{TsharkCommand::defaultTsharkPath()};
 };
 
 // SQLiteUtil测试夹具
@@ -43,8 +49,8 @@ class IntegrationTest : public ::testing::Test {
 protected:
     void SetUp() override {
         // 创建测试目录
-        system("mkdir -p test_data");
-        
+        makeDirs("test_data");
+
         // 删除可能存在的旧测试文件
         std::remove(testDbPath.c_str());
         std::remove(testXmlPath.c_str());
@@ -65,7 +71,8 @@ protected:
     std::string testJsonPath = "test_data/test.json";
     
     // 测试对象
-    TsharkManager tsharkManager{"./test_output"};
+    PcapAnalyzer        analyzer{TsharkCommand::defaultTsharkPath()};
+    PdmlToJsonConverter converter{TsharkCommand::defaultTsharkPath()};
 };
 
 // 测试SQLiteUtil类的基本功能
@@ -123,8 +130,8 @@ TEST_F(SQLiteUtilTest, BasicFunctions) {
     EXPECT_EQ(queriedPackets[0]->file_offset, 42);
 }
 
-// 测试TsharkManager的离线分析功能
-TEST_F(TsharkManagerTest, OfflineAnalysis) {
+// 测试离线分析功能
+TEST_F(OfflineAnalysisTest, OfflineAnalysis) {
     // 创建测试PCAP文件路径
     // 注意：这个测试需要一个有效的PCAP文件，可以在测试前创建或使用已有的文件
     std::string testPcapPath = "test_data/test.pcap";
@@ -138,11 +145,11 @@ TEST_F(TsharkManagerTest, OfflineAnalysis) {
     
     // 测试离线分析功能
     std::vector<std::shared_ptr<Packet>> packets;
-    EXPECT_TRUE(tsharkManager.analysisFile(testPcapPath, packets));
-    
+    EXPECT_TRUE(analyzer.analysisFile(testPcapPath, packets));
+
     // 验证分析结果
     EXPECT_GT(packets.size(), 0) << "应该至少解析出一个数据包";
-    
+
     // 检查第一个数据包的基本属性
     if (!packets.empty()) {
         EXPECT_GT(packets[0]->frame_number, 0);
@@ -154,8 +161,32 @@ TEST_F(TsharkManagerTest, OfflineAnalysis) {
     }
 }
 
+// 流式分析（主题 9）：回调式重载逐包回调、不累积到 allPackets，
+// 其回调次数应与累积式解析出的包数完全一致。
+TEST_F(OfflineAnalysisTest, StreamingMatchesAccumulating) {
+    std::string testPcapPath = "test_data/test.pcap";
+
+    std::ifstream testFile(testPcapPath);
+    if (!testFile.good()) {
+        GTEST_SKIP() << "跳过流式分析测试，因为测试PCAP文件不存在: " << testPcapPath;
+    }
+    testFile.close();
+
+    // 累积式：拿到全量包数作为基准
+    std::vector<std::shared_ptr<Packet>> packets;
+    ASSERT_TRUE(analyzer.analysisFile(testPcapPath, packets));
+
+    // 流式：只数回调次数，不保留任何 Packet
+    size_t       streamed = 0;
+    PcapAnalyzer streamingAnalyzer{TsharkCommand::defaultTsharkPath()};
+    ASSERT_TRUE(streamingAnalyzer.analysisFile(
+        testPcapPath, [&streamed](const Packet&) { ++streamed; }));
+
+    EXPECT_EQ(streamed, packets.size()) << "流式回调次数应等于累积解析出的包数";
+}
+
 // 测试PCAP到XML和JSON的转换功能
-TEST_F(TsharkManagerTest, FileConversion) {
+TEST_F(OfflineAnalysisTest, FileConversion) {
     // 创建测试PCAP文件路径
     std::string testPcapPath = "test_data/test.pcap";
     std::string testXmlPath = "test_data/test.xml";
@@ -173,16 +204,16 @@ TEST_F(TsharkManagerTest, FileConversion) {
     std::remove(testJsonPath.c_str());
     
     // 测试PCAP到XML的转换
-    EXPECT_TRUE(tsharkManager.convertPcapToXml(testPcapPath, testXmlPath));
-    
+    EXPECT_TRUE(converter.convertPcapToXml(testPcapPath, testXmlPath));
+
     // 验证XML文件已创建
     std::ifstream xmlFile(testXmlPath);
     EXPECT_TRUE(xmlFile.good()) << "XML文件应该已创建";
     xmlFile.close();
-    
+
     // 测试XML到JSON的转换
-    EXPECT_TRUE(tsharkManager.convertXmlToJson(testXmlPath, testJsonPath));
-    
+    EXPECT_TRUE(converter.convertXmlToJson(testXmlPath, testJsonPath));
+
     // 验证JSON文件已创建
     std::ifstream jsonFile(testJsonPath);
     EXPECT_TRUE(jsonFile.good()) << "JSON文件应该已创建";
@@ -238,17 +269,17 @@ TEST_F(IntegrationTest, OfflineAnalysisWorkflow) {
     
     // 解析PCAP文件
     std::vector<std::shared_ptr<Packet>> packets;
-    EXPECT_TRUE(tsharkManager.analysisFile(testPcapPath, packets));
+    EXPECT_TRUE(analyzer.analysisFile(testPcapPath, packets));
     EXPECT_GT(packets.size(), 0) << "应该至少解析出一个数据包";
-    
+
     // 将数据包插入到数据库
     EXPECT_TRUE(sqliteUtil.insertPacket(packets));
-    
+
     // 将PCAP文件转换为XML
-    EXPECT_TRUE(tsharkManager.convertPcapToXml(testPcapPath, testXmlPath));
-    
+    EXPECT_TRUE(converter.convertPcapToXml(testPcapPath, testXmlPath));
+
     // 将XML文件转换为JSON
-    EXPECT_TRUE(tsharkManager.convertXmlToJson(testXmlPath, testJsonPath));
+    EXPECT_TRUE(converter.convertXmlToJson(testXmlPath, testJsonPath));
     
     // 验证所有输出文件都已创建
     std::ifstream dbFile(testDbPath);

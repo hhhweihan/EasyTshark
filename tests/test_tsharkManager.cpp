@@ -4,34 +4,20 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "tsharkManager.hpp"
+#include "PdmlToJsonConverter.hpp"
+#include "test_fs_util.hpp"
+#include "tsharkCommand.hpp"
 
-// 检查文件是否存在
-bool fileExists(const std::string& filename)
-{
-    struct stat buffer;
-    return (stat(filename.c_str(), &buffer) == 0);
-}
-
-// 创建目录
-bool createDirectory(const std::string& dirName)
-{
-    return mkdir(dirName.c_str(), 0755) == 0 || errno == EEXIST;
-}
-
-// 递归删除目录
-void removeDirectory(const std::string& dirName)
-{
-    std::string cmd = "rm -rf " + dirName;
-    system(cmd.c_str());
-}
+using testfs::fileExists;
+using testfs::makeDirs;
+using testfs::removeTree;
 
 // 创建测试目录和文件的辅助函数
 void createTestFiles()
 {
     // 确保测试目录存在
     std::string testDir = "test_data";
-    createDirectory(testDir);
+    makeDirs(testDir);
 
     // 创建测试XML文件
     std::string xmlContent = R"(<?xml version="1.0" encoding="utf-8"?>
@@ -52,32 +38,32 @@ void createTestFiles()
     xmlFile.close();
 }
 
-class TsharkManagerTest : public ::testing::Test
+class TsharkToolsTest : public ::testing::Test
 {
 protected:
     void SetUp() override
     {
         createTestFiles();
-        tsharkManager = new TsharkManager("/root/dev/learn_from_xuanyuan/output");
+        converter = new PdmlToJsonConverter(TsharkCommand::defaultTsharkPath());
     }
 
     void TearDown() override
     {
-        delete tsharkManager;
+        delete converter;
         // 清理测试文件
-        removeDirectory("test_data");
+        removeTree("test_data");
     }
 
-    TsharkManager* tsharkManager;
+    PdmlToJsonConverter* converter;
 };
 
 // 测试XML到JSON的转换
-TEST_F(TsharkManagerTest, ConvertXmlToJson)
+TEST_F(TsharkToolsTest, ConvertXmlToJson)
 {
     std::string xmlFile  = "test_data/test.xml";
     std::string jsonFile = "test_data/test.json";
 
-    ASSERT_TRUE(tsharkManager->convertXmlToJson(xmlFile, jsonFile));
+    ASSERT_TRUE(converter->convertXmlToJson(xmlFile, jsonFile));
 
     // 验证JSON文件是否存在
     ASSERT_TRUE(fileExists(jsonFile));
@@ -97,9 +83,10 @@ TEST_F(TsharkManagerTest, ConvertXmlToJson)
 }
 
 // 测试获取网络适配器信息
-TEST_F(TsharkManagerTest, GetNetworkAdapterInfo)
+TEST_F(TsharkToolsTest, GetNetworkAdapterInfo)
 {
-    std::vector<AdapterInfo> adapters = tsharkManager->getNetworkAdapterInfo();
+    std::vector<AdapterInfo> adapters =
+        TsharkCommand::listNetworkAdapters(TsharkCommand::defaultTsharkPath());
 
     // 验证至少有一个网络适配器
     EXPECT_GT(adapters.size(), 0);
@@ -112,11 +99,11 @@ TEST_F(TsharkManagerTest, GetNetworkAdapterInfo)
     }
 }
 
-// 测试TsharkManager构造函数
-TEST_F(TsharkManagerTest, Constructor)
+// 测试转换器构造函数
+TEST_F(TsharkToolsTest, Constructor)
 {
     // 验证tsharkPath不为空
-    EXPECT_FALSE(tsharkManager->getTsharkPath().empty());
+    EXPECT_FALSE(converter->getTsharkPath().empty());
 }
 
 int main(int argc, char** argv)

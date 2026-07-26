@@ -7,6 +7,10 @@
 
 #include "utils.hpp"
 #include "processUtil.hpp"
+#include "test_fs_util.hpp"
+
+using testfs::makeDirs;
+using testfs::removeTree;
 
 class CommonUtilTest : public ::testing::Test
 {
@@ -52,13 +56,13 @@ protected:
     void SetUp() override
     {
         // 创建测试目录
-        system("mkdir -p /tmp/test_data");
+        makeDirs("/tmp/test_data");
     }
 
     void TearDown() override
     {
         // 清理测试目录
-        system("rm -rf /tmp/test_data");
+        removeTree("/tmp/test_data");
     }
 };
 
@@ -237,8 +241,8 @@ TEST_F(SQLiteUtilTest, SaveQueryResultToFile) {
     EXPECT_TRUE(sqliteUtil.insertPacket(packets));
     
     // 创建测试目录
-    system("mkdir -p /tmp/test_data");
-    
+    makeDirs("/tmp/test_data");
+
     // 测试查询和保存结果
     std::map<std::string, std::string> conditions;
     conditions["location"] = "湖南";

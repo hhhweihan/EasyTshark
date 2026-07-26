@@ -5,6 +5,7 @@ set(TEST_SOURCES
     test_error_handling.cpp
     test_performance.cpp
     test_offline_analysis.cpp
+    test_packet_parser.cpp
 )
 
 # 下载并包含GoogleTest源码
@@ -40,15 +41,18 @@ target_include_directories(unit_tests PRIVATE
 )
 
 # 链接GoogleTest和项目库
-target_link_libraries(unit_tests 
+target_link_libraries(unit_tests
     gtest
     gtest_main
     gmock
     gmock_main
     tshark_lib
     pthread
-    dl
 )
+# libdl 仅 Linux 需要（macOS 的 dlopen 在 libSystem 内，无独立 libdl）
+if(NOT APPLE)
+    target_link_libraries(unit_tests dl)
+endif()
 
 # 添加测试
 add_test(NAME unit_tests COMMAND unit_tests) 

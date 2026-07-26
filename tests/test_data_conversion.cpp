@@ -7,31 +7,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "tsharkManager.hpp"
+#include "PdmlToJsonConverter.hpp"
+#include "test_fs_util.hpp"
+#include "tsharkCommand.hpp"
+
+using testfs::fileExists;
+using testfs::makeDirs;
+using testfs::removeTree;
 
 // 测试辅助函数
 namespace
 {
-    // 检查文件是否存在
-    bool fileExists(const std::string& filename)
-    {
-        struct stat buffer;
-        return (stat(filename.c_str(), &buffer) == 0);
-    }
-
-    // 创建目录
-    bool createDirectory(const std::string& dirName)
-    {
-        return mkdir(dirName.c_str(), 0755) == 0 || errno == EEXIST;
-    }
-
-    // 递归删除目录
-    void removeDirectory(const std::string& dirName)
-    {
-        std::string cmd = "rm -rf " + dirName;
-        system(cmd.c_str());
-    }
-
     // 读取文件内容
     std::string readFileContent(const std::string& filename)
     {
@@ -83,8 +69,8 @@ protected:
     std::string    testDir;
     std::string    pcapFile;
     std::string    xmlFile;
-    std::string    jsonFile;
-    TsharkManager* tsharkManager;
+    std::string          jsonFile;
+    PdmlToJsonConverter* converter;
 
     void SetUp() override
     {
@@ -94,21 +80,21 @@ protected:
         jsonFile = testDir + "/test.json";
 
         // 创建测试目录
-        createDirectory(testDir);
+        makeDirs(testDir);
 
         // 创建测试文件
         createTestXmlFile(xmlFile);
         createTestPcapFile(pcapFile);
 
-        // 创建TsharkManager实例
-        tsharkManager = new TsharkManager("/root/dev/learn_from_xuanyuan/output");
+        // 创建转换器实例
+        converter = new PdmlToJsonConverter(TsharkCommand::defaultTsharkPath());
     }
 
     void TearDown() override
     {
         // 清理测试文件和目录
-        removeDirectory(testDir);
-        delete tsharkManager;
+        removeTree(testDir);
+        delete converter;
     }
 };
 
@@ -116,7 +102,7 @@ protected:
 TEST_F(DataConversionTest, ConvertXmlToJson)
 {
     // 执行转换
-    bool result = tsharkManager->convertXmlToJson(xmlFile, jsonFile);
+    bool result = converter->convertXmlToJson(xmlFile, jsonFile);
 
     // 验证转换成功
     EXPECT_TRUE(result);
@@ -141,12 +127,12 @@ TEST_F(DataConversionTest, ConvertXmlToJson)
 // 测试PCAP到XML的转换功能（模拟测试，因为实际转换需要tshark命令）
 TEST_F(DataConversionTest, ConvertPcapToXml_Mock)
 {
-    // 创建一个模拟的TsharkManager类，覆盖convertPcapToXml方法
-    class MockTsharkManager : public TsharkManager
+    // 创建一个模拟的转换器类，覆盖convertPcapToXml方法
+    class MockPdmlToJsonConverter : public PdmlToJsonConverter
     {
     public:
-        MockTsharkManager(const std::string& path)
-            : TsharkManager(path)
+        MockPdmlToJsonConverter(const std::string& path)
+            : PdmlToJsonConverter(path)
         {
         }
 
@@ -162,11 +148,11 @@ TEST_F(DataConversionTest, ConvertPcapToXml_Mock)
     };
 
     // 使用模拟对象
-    MockTsharkManager mockManager("/root/dev/learn_from_xuanyuan/output");
-    std::string       outputXml = testDir + "/output.xml";
+    MockPdmlToJsonConverter mockConverter(TsharkCommand::defaultTsharkPath());
+    std::string             outputXml = testDir + "/output.xml";
 
     // 执行转换
-    bool result = mockManager.convertPcapToXml(pcapFile, outputXml);
+    bool result = mockConverter.convertPcapToXml(pcapFile, outputXml);
 
     // 验证结果
     EXPECT_TRUE(result);
@@ -183,12 +169,12 @@ TEST_F(DataConversionTest, DISABLED_ConvertPcapToJsonIntegration)
     std::string outputJson = testDir + "/output.json";
 
     // 执行PCAP到XML的转换
-    bool xmlResult = tsharkManager->convertPcapToXml(pcapFile, outputXml);
+    bool xmlResult = converter->convertPcapToXml(pcapFile, outputXml);
     EXPECT_TRUE(xmlResult);
     EXPECT_TRUE(fileExists(outputXml));
 
     // 执行XML到JSON的转换
-    bool jsonResult = tsharkManager->convertXmlToJson(outputXml, outputJson);
+    bool jsonResult = converter->convertXmlToJson(outputXml, outputJson);
     EXPECT_TRUE(jsonResult);
     EXPECT_TRUE(fileExists(outputJson));
 }
@@ -215,7 +201,7 @@ TEST_F(DataConversionTest, ConvertXmlNodeToJsonIndirect)
     xmlFile.close();
 
     // 执行转换
-    bool result = tsharkManager->convertXmlToJson(simpleXmlFile, simpleJsonFile);
+    bool result = converter->convertXmlToJson(simpleXmlFile, simpleJsonFile);
     EXPECT_TRUE(result);
     EXPECT_TRUE(fileExists(simpleJsonFile));
 

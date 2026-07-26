@@ -1,25 +1,43 @@
 #ifndef tsharkDataType_hpp
 #define tsharkDataType_hpp
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 struct Packet
 {
-    int         frame_number; // 数据包编号
-    double      time;         // 数据包的时间戳
-    uint32_t    cap_len;
-    uint32_t    len;
+    // 类内初始化（C++11）：确保 parseLine 未显式赋值的字段（如无端口的包）
+    // 不会残留未定义值被写入数据库
+    int         frame_number = 0; // 数据包编号
+    double      time         = 0.0; // 数据包的时间戳
+    uint32_t    cap_len      = 0;
+    uint32_t    len          = 0;
     std::string src_mac;
     std::string dst_mac;
     std::string src_ip; // 源IP地址
     std::string src_location;
-    uint16_t    src_port;
+    uint16_t    src_port = 0;
     std::string dst_ip; // 目的IP地址
     std::string dst_location;
-    uint16_t    dst_port;
+    uint16_t    dst_port = 0;
     std::string protocol;
     std::string info; // 数据包的概要信息
-    uint32_t    file_offset;
+    // 该报文在 pcap 文件中的字节偏移。累计值可超过 4GB，用 64 位避免大文件溢出。
+    uint64_t file_offset = 0;
+    // 传输层协议（"TCP"/"UDP"/""）：仅内存态、不入库，由 parseLine 依据
+    // tcp/udp 端口字段哪个非空推断，供 GUI 的会话视图区分 TCP / UDP 会话。
+    std::string transport;
+};
+
+// 协议分层树的一个节点：把 tshark PDML 的 proto / field 逐层解析成
+// label（显示名）+ value（取值）+ children（子字段），供详情面板递归展开。
+// 只承载展示用文本，不做协议语义解释。
+struct DetailNode
+{
+    std::string             label; // 显示名（PDML showname，回退到 name）
+    std::string             value; // 取值（PDML show，回退到 value）
+    std::vector<DetailNode> children;
 };
 
 // PCAP全局文件头

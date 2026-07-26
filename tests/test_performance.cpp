@@ -8,31 +8,17 @@
 #include <unistd.h>
 #include <vector>
 
-#include "tsharkManager.hpp"
+#include "PdmlToJsonConverter.hpp"
+#include "test_fs_util.hpp"
+#include "tsharkCommand.hpp"
+
+using testfs::fileExists;
+using testfs::makeDirs;
+using testfs::removeTree;
 
 // 测试辅助函数
 namespace
 {
-    // 检查文件是否存在
-    bool fileExists(const std::string& filename)
-    {
-        struct stat buffer;
-        return (stat(filename.c_str(), &buffer) == 0);
-    }
-
-    // 创建目录
-    bool createDirectory(const std::string& dirName)
-    {
-        return mkdir(dirName.c_str(), 0755) == 0 || errno == EEXIST;
-    }
-
-    // 递归删除目录
-    void removeDirectory(const std::string& dirName)
-    {
-        std::string cmd = "rm -rf " + dirName;
-        system(cmd.c_str());
-    }
-
     // 创建大型XML测试文件
     void createLargeXmlFile(const std::string& filePath, int numPackets)
     {
@@ -77,20 +63,20 @@ namespace
 class PerformanceTest : public ::testing::Test
 {
 protected:
-    std::string    testDir;
-    TsharkManager* tsharkManager;
+    std::string          testDir;
+    PdmlToJsonConverter* converter;
 
     void SetUp() override
     {
         testDir = "test_performance";
-        createDirectory(testDir);
-        tsharkManager = new TsharkManager("/root/dev/learn_from_xuanyuan/output");
+        makeDirs(testDir);
+        converter = new PdmlToJsonConverter(TsharkCommand::defaultTsharkPath());
     }
 
     void TearDown() override
     {
-        removeDirectory(testDir);
-        delete tsharkManager;
+        removeTree(testDir);
+        delete converter;
     }
 
     // 测量函数执行时间的辅助方法
@@ -123,7 +109,7 @@ TEST_F(PerformanceTest, DISABLED_XmlToJsonPerformance)
 
         // 测量转换时间
         long long duration =
-            measureExecutionTime([&]() { tsharkManager->convertXmlToJson(xmlFile, jsonFile); });
+            measureExecutionTime([&]() { converter->convertXmlToJson(xmlFile, jsonFile); });
 
         executionTimes.push_back(duration);
 
@@ -158,7 +144,7 @@ TEST_F(PerformanceTest, DISABLED_ConversionStability)
         std::string jsonFile = testDir + "/stability_test_" + std::to_string(i) + ".json";
 
         long long duration =
-            measureExecutionTime([&]() { tsharkManager->convertXmlToJson(xmlFile, jsonFile); });
+            measureExecutionTime([&]() { converter->convertXmlToJson(xmlFile, jsonFile); });
 
         executionTimes.push_back(duration);
         std::cout << "运行 #" << (i + 1) << " 耗时: " << duration << " 毫秒" << std::endl;
