@@ -15,3 +15,6 @@ output/*.exe
 imgui.ini
 logs/
 data/
+
+# 设计/构建文档，仅本地保留，不纳入版本控制
+docs/

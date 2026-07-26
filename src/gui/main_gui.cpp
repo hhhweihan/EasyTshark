@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <future>
 #include <map>
@@ -204,6 +205,32 @@ ImVec4 protocolColor(const std::string& proto)
     if (containsIgnore(proto, "ARP"))
         return ImVec4(0.95f, 0.90f, 0.45f, 1.0f); // 黄
     return ImVec4(0.80f, 0.80f, 0.80f, 1.0f);
+}
+
+// 把 frame.time_epoch（自 1970 起的秒，带小数）格式化成人类可读的本地时间
+// "MM-DD HH:MM:SS.mmm"。原始时间戳信息量大但不直观，单独给一列易读时间。
+// localtime 的静态缓冲不可重入，按平台用 localtime_s / localtime_r 写入栈上 tm。
+std::string formatEpoch(double epoch)
+{
+    if (epoch <= 0.0)
+        return "";
+    std::time_t secs = static_cast<std::time_t>(epoch);
+    int         ms   = static_cast<int>((epoch - static_cast<double>(secs)) * 1000.0 + 0.5);
+    if (ms >= 1000) // 进位到下一秒，避免出现 ".1000"
+    {
+        ms = 0;
+        secs += 1;
+    }
+    std::tm tm{};
+#if defined(_WIN32)
+    localtime_s(&tm, &secs);
+#else
+    localtime_r(&secs, &tm);
+#endif
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%02d-%02d %02d:%02d:%02d.%03d", tm.tm_mon + 1, tm.tm_mday,
+                  tm.tm_hour, tm.tm_min, tm.tm_sec, ms);
+    return buf;
 }
 
 // 报文是否属于当前协议快速分类（报文页左侧“数据包”类目的前端过滤）。
@@ -734,43 +761,46 @@ void drawPacketRow(AppState& s, const PacketPtr& p)
     }
 
     ImGui::TableSetColumnIndex(1);
+    ImGui::TextUnformatted(formatEpoch(p->time).c_str());
+
+    ImGui::TableSetColumnIndex(2);
     ImGui::Text("%.6f", p->time);
 
     // 源 IP/Mac（+ 内网标签）
-    ImGui::TableSetColumnIndex(2);
+    ImGui::TableSetColumnIndex(3);
     ImGui::TextUnformatted(p->src_ip.empty() ? p->src_mac.c_str() : p->src_ip.c_str());
     if (isPrivateIp(p->src_ip))
     {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "[内网]");
     }
-    ImGui::TableSetColumnIndex(3);
-    ImGui::TextUnformatted(p->src_location.c_str());
     ImGui::TableSetColumnIndex(4);
+    ImGui::TextUnformatted(p->src_location.c_str());
+    ImGui::TableSetColumnIndex(5);
     if (p->src_port)
         ImGui::Text("%u", p->src_port);
 
     // 目的 IP/Mac（+ 内网标签）
-    ImGui::TableSetColumnIndex(5);
+    ImGui::TableSetColumnIndex(6);
     ImGui::TextUnformatted(p->dst_ip.empty() ? p->dst_mac.c_str() : p->dst_ip.c_str());
     if (isPrivateIp(p->dst_ip))
     {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "[内网]");
     }
-    ImGui::TableSetColumnIndex(6);
-    ImGui::TextUnformatted(p->dst_location.c_str());
     ImGui::TableSetColumnIndex(7);
+    ImGui::TextUnformatted(p->dst_location.c_str());
+    ImGui::TableSetColumnIndex(8);
     if (p->dst_port)
         ImGui::Text("%u", p->dst_port);
 
     // 协议（彩色徽标）
-    ImGui::TableSetColumnIndex(8);
+    ImGui::TableSetColumnIndex(9);
     ImGui::TextColored(protocolColor(p->protocol), "%s", p->protocol.c_str());
 
-    ImGui::TableSetColumnIndex(9);
-    ImGui::Text("%u", p->len);
     ImGui::TableSetColumnIndex(10);
+    ImGui::Text("%u", p->len);
+    ImGui::TableSetColumnIndex(11);
     ImGui::TextUnformatted(p->info.c_str());
 }
 
@@ -797,11 +827,12 @@ void drawPacketTable(AppState& s)
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
     // 表格占据除底部分页条外的空间
     float tableHeight = ImGui::GetContentRegionAvail().y - (s.liveCapturing ? 0.0f : 34.0f);
-    if (ImGui::BeginTable("packets", 11, flags, ImVec2(0, tableHeight)))
+    if (ImGui::BeginTable("packets", 12, flags, ImVec2(0, tableHeight)))
     {
         ImGui::TableSetupScrollFreeze(0, 1);
         ImGui::TableSetupColumn("No.", ImGuiTableColumnFlags_WidthFixed, 55);
-        ImGui::TableSetupColumn("时间", ImGuiTableColumnFlags_WidthFixed, 100);
+        ImGui::TableSetupColumn("时间", ImGuiTableColumnFlags_WidthFixed, 135);
+        ImGui::TableSetupColumn("时间戳", ImGuiTableColumnFlags_WidthFixed, 100);
         ImGui::TableSetupColumn("源IP/Mac", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("源归属地", ImGuiTableColumnFlags_WidthFixed, 110);
         ImGui::TableSetupColumn("源端口", ImGuiTableColumnFlags_WidthFixed, 60);
@@ -906,7 +937,10 @@ void drawDetail(AppState& s)
 
     // 协议分层树（占上半区）
     ImGui::TextUnformatted("协议分层:");
-    ImGui::BeginChild("prototree", ImVec2(0, ImGui::GetContentRegionAvail().y * 0.5f), true);
+    // 加 HorizontalScrollbar：深层嵌套字段展开后单行常超出可视宽度，
+    // 无横向滚动只能被裁剪；有了它可左右拖动查看完整内容。
+    ImGui::BeginChild("prototree", ImVec2(0, ImGui::GetContentRegionAvail().y * 0.5f), true,
+                      ImGuiWindowFlags_HorizontalScrollbar);
     if (s.detailLoaded && !s.detail.children.empty())
     {
         int i = 0;

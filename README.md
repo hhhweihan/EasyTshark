@@ -81,7 +81,7 @@ flowchart LR
 
 - **操作系统**（所有平台差异均以 `#if defined(_WIN32)` / `#else` 隔离，POSIX 路径行为不变）：
   - **macOS**：已支持并验证（抓包 / 监控经 `EventPoller` 的 `poll` 实现，tshark 由 Wireshark.app 提供）。
-  - **Windows**：已支持（MSVC 原生编译；进程与管道走 `CreateProcessA` / `CreatePipe`，多路复用走 `PeekNamedPipe` 轮询，tshark 路径自动探测含注册表）。详见 [docs/BUILD_WINDOWS.md](docs/BUILD_WINDOWS.md)。
+  - **Windows**：已支持（MSVC 原生编译；进程与管道走 `CreateProcessA` / `CreatePipe`，多路复用走 `PeekNamedPipe` 轮询，tshark 路径自动探测含注册表）。构建步骤见下方「编译项目」。
   - **Linux**：与 macOS 共用可移植的 `poll` 实现，理论支持，**尚待再次实测验证**。
 - tshark（Wireshark 命令行工具）
 - SQLite3
@@ -120,7 +120,6 @@ sudo apt-get install -y build-essential cmake tshark libsqlite3-dev
 
 **Windows（MSVC）**：安装 [Wireshark](https://www.wireshark.org/)（提供 `tshark.exe`）与
 VS 2022 Build Tools（含 C++ 工作负载，自带 CMake / Ninja）。sqlite3 已 vendored，无需另装。
-详见 [docs/BUILD_WINDOWS.md](docs/BUILD_WINDOWS.md)。
 
 ### 2. 克隆仓库
 
@@ -166,8 +165,7 @@ cmake --build build
 构建产物输出到 `output/` 目录：`tshark_main`（CLI）、`tshark_gui`（GUI，依赖就位时）、`unit_tests`（测试）。
 
 **Windows（MSVC）**：在普通 `cmd` 中运行 `scripts\build_windows.bat`（勿用 Git Bash），
-产物为 `output\tshark_main.exe` / `output\tshark_gui.exe`。完整步骤见
-[docs/BUILD_WINDOWS.md](docs/BUILD_WINDOWS.md)。
+产物为 `output\tshark_main.exe` / `output\tshark_gui.exe`。
 
 ## 使用方法
 
@@ -284,8 +282,6 @@ cmake --build build
 │   ├── xdb_search.cc / xdb_bench.cc  # ip2region 实现
 │   ├── platform/EventPollerPoll.cpp  # poll 实现
 │   └── gui/main_gui.cpp        # GUI 主程序入口
-├── docs/                       # 设计与重构文档
-│   └── REFACTOR_ROADMAP.md     # 重构路线图
 ├── tests/                      # 单元测试目录
 │   ├── CMakeLists.txt
 │   ├── test_tsharkManager.cpp  # TsharkToolsTest
