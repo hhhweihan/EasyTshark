@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 设置项目目录和构建目录
-PROJECT_DIR=$(dirname "$(realpath $0)")
+PROJECT_DIR=$(dirname "$(dirname "$(realpath $0)")")
 BUILD_DIR="${PROJECT_DIR}/build"
 OUTPUT_DIR="${PROJECT_DIR}/output"
 
@@ -79,34 +79,34 @@ echo "compile success!"
 if [ "$RUN_TESTS" = true ]; then
     echo "run unit tests..."
     cd "${PROJECT_DIR}"
-    
+
     if [ -f "${OUTPUT_DIR}/unit_tests" ]; then
         # 准备测试命令
         TEST_CMD="${OUTPUT_DIR}/unit_tests"
-        
+
         # 如果指定了特定测试，添加过滤参数
         if [ -n "$SPECIFIC_TEST" ]; then
             TEST_CMD="${TEST_CMD} --gtest_filter=${SPECIFIC_TEST}"
             echo "run specific test: ${SPECIFIC_TEST}"
         fi
-        
+
         # 创建临时文件保存测试输出
         TEST_OUTPUT_FILE=$(mktemp)
-        
+
         # 运行测试并保存输出
         ${TEST_CMD} | tee ${TEST_OUTPUT_FILE}
         TEST_RESULT=$?
-        
+
         # 分析测试结果
         PASSED_TESTS=$(grep -o "\[  PASSED  \] [0-9]* test" ${TEST_OUTPUT_FILE} | grep -o "[0-9]*")
         FAILED_TESTS=$(grep -o "\[  FAILED  \] [0-9]* test" ${TEST_OUTPUT_FILE} | grep -o "[0-9]*")
         DISABLED_TESTS=$(grep -o "YOU HAVE [0-9]* DISABLED TESTS" ${TEST_OUTPUT_FILE} | grep -o "[0-9]*")
-        
+
         # 如果没有找到数字，设置为0
         PASSED_TESTS=${PASSED_TESTS:-0}
         FAILED_TESTS=${FAILED_TESTS:-0}
         DISABLED_TESTS=${DISABLED_TESTS:-0}
-        
+
         echo ""
         echo "test result summary:"
         echo "   passed: ${PASSED_TESTS} tests"
@@ -114,10 +114,10 @@ if [ "$RUN_TESTS" = true ]; then
         if [ -n "$DISABLED_TESTS" ] && [ "$DISABLED_TESTS" -gt 0 ]; then
             echo "   disabled: ${DISABLED_TESTS} tests"
         fi
-        
+
         # 清理临时文件
         rm -f ${TEST_OUTPUT_FILE}
-        
+
         # 检查测试是否成功
         if [ $TEST_RESULT -ne 0 ]; then
             if [ "$IGNORE_TEST_FAILURES" = true ]; then

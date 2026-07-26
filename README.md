@@ -1,6 +1,6 @@
 # EasyTshark - 网络数据包捕获与分析工具
 
-本仓库是 EasyTshark 的 **C++ 学习版本**，从零用 C++11 重写核心抓包与分析逻辑，供学习网络编程、进程管理、SQLite 集成参考。社区正式版由 **“轩辕之风”老师** 维护，见 [easytshark.com](https://www.easytshark.com/)。
+本仓库是 EasyTshark 的 **C++ 版本**，从零用 C++11 重写核心抓包与分析逻辑，供学习网络编程、进程管理、SQLite 集成参考。社区正式版由 **“轩辕之风”老师** 维护，见 [easytshark.com](https://www.easytshark.com/)。
 
 EasyTshark 是一个基于 tshark 的网络数据包分析工具，提供实时抓包和离线分析功能，支持数据包的 SQLite 存储和 XML/JSON 格式转换，并提供**命令行**与**原生图形界面**两种前端。
 
