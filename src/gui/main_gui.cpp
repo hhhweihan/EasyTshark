@@ -823,25 +823,30 @@ void drawPacketTable(AppState& s)
         ImGui::Text("共 %zu 条%s", s.view.size(), s.displayFilterOn ? "（已过滤）" : "");
     }
 
+    // ScrollX：窗口偏窄时列会被挤压到显示不全（IP/归属地被截成“...”）。开启横向滚动后
+    // 各列保持固定宽度、总宽超出可视区时可左右拖动查看完整内容。
+    // 注意：ScrollX 下 WidthStretch 列不再自动填充，故下面把原先拉伸的列改为固定宽度。
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                  ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+                                  ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
+                                  ImGuiTableFlags_Resizable;
     // 表格占据除底部分页条外的空间
     float tableHeight = ImGui::GetContentRegionAvail().y - (s.liveCapturing ? 0.0f : 34.0f);
     if (ImGui::BeginTable("packets", 12, flags, ImVec2(0, tableHeight)))
     {
-        ImGui::TableSetupScrollFreeze(0, 1);
+        // 冻结表头行 + 首列（No.）：横向滚动时帧号始终可见，便于对照
+        ImGui::TableSetupScrollFreeze(1, 1);
         ImGui::TableSetupColumn("No.", ImGuiTableColumnFlags_WidthFixed, 55);
         ImGui::TableSetupColumn("时间", ImGuiTableColumnFlags_WidthFixed, 135);
         ImGui::TableSetupColumn("时间戳", ImGuiTableColumnFlags_WidthFixed, 100);
-        ImGui::TableSetupColumn("源IP/Mac", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("源IP/Mac", ImGuiTableColumnFlags_WidthFixed, 175);
         ImGui::TableSetupColumn("源归属地", ImGuiTableColumnFlags_WidthFixed, 110);
         ImGui::TableSetupColumn("源端口", ImGuiTableColumnFlags_WidthFixed, 60);
-        ImGui::TableSetupColumn("目的IP/Mac", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("目的IP/Mac", ImGuiTableColumnFlags_WidthFixed, 175);
         ImGui::TableSetupColumn("目的归属地", ImGuiTableColumnFlags_WidthFixed, 110);
         ImGui::TableSetupColumn("目的端口", ImGuiTableColumnFlags_WidthFixed, 60);
         ImGui::TableSetupColumn("协议", ImGuiTableColumnFlags_WidthFixed, 70);
         ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 55);
-        ImGui::TableSetupColumn("信息", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("信息", ImGuiTableColumnFlags_WidthFixed, 600);
         ImGui::TableHeadersRow();
 
         if (s.liveCapturing)
