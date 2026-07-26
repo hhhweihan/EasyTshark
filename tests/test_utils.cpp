@@ -7,6 +7,10 @@
 
 #include "utils.hpp"
 #include "processUtil.hpp"
+#include "test_fs_util.hpp"
+
+using testfs::makeDirs;
+using testfs::removeTree;
 
 class CommonUtilTest : public ::testing::Test
 {
@@ -46,19 +50,23 @@ TEST_F(CommonUtilTest, GetCurrentTime)
     EXPECT_TRUE(std::regex_match(currentTime, timeRegex));
 }
 
+// ProcessUtilTest 依赖 POSIX/shell 语义（pid_t、/bin/sh 重定向、/tmp、sleep、pclose），
+// 与 Windows 的 cmd.exe / HANDLE 模型不兼容。这里整体仅在 POSIX 编译，
+// 保持 Linux/macOS 行为不变；Windows 下跳过该套件（进程封装本身已在业务代码中跨平台覆盖）。
+#if !defined(_WIN32)
 class ProcessUtilTest : public ::testing::Test
 {
 protected:
     void SetUp() override
     {
         // 创建测试目录
-        system("mkdir -p /tmp/test_data");
+        makeDirs("/tmp/test_data");
     }
 
     void TearDown() override
     {
         // 清理测试目录
-        system("rm -rf /tmp/test_data");
+        removeTree("/tmp/test_data");
     }
 };
 
@@ -124,6 +132,7 @@ TEST_F(ProcessUtilTest, Kill)
     // 标记测试为通过，因为我们只关心Kill函数不会崩溃
     SUCCEED() << "Kill函数执行完成，不管结果如何";
 }
+#endif // !_WIN32
 
 class SQLiteUtilTest : public ::testing::Test
 {
@@ -221,6 +230,43 @@ TEST_F(SQLiteUtilTest, QueryPackets) {
     EXPECT_TRUE(jsonResult.find("192.168.2.1") == std::string::npos);
 }
 
+// 分页查询：queryPacket(packetList, limit, offset) 按 frame_number 升序取指定窗口。
+TEST_F(SQLiteUtilTest, QueryPacketPagination) {
+    SQLiteUtil sqliteUtil(dbPath);
+    EXPECT_TRUE(sqliteUtil.createPacketTable());
+
+    // 插入 5 个数据包，frame_number 1..5
+    std::vector<std::shared_ptr<Packet>> packets;
+    for (int i = 1; i <= 5; ++i)
+    {
+        auto p          = std::make_shared<Packet>();
+        p->frame_number = i;
+        p->src_ip       = "10.0.0." + std::to_string(i);
+        packets.push_back(p);
+    }
+    EXPECT_TRUE(sqliteUtil.insertPacket(packets));
+
+    // 取第 2 页，每页 2 条（offset=2, limit=2）→ frame_number 3、4
+    std::vector<std::shared_ptr<Packet>> page;
+    EXPECT_TRUE(sqliteUtil.queryPacket(page, 2, 2));
+    ASSERT_EQ(page.size(), 2u);
+    EXPECT_EQ(page[0]->frame_number, 3);
+    EXPECT_EQ(page[1]->frame_number, 4);
+
+    // 末页不足一整页：offset=4, limit=10 → 仅剩 frame_number 5
+    std::vector<std::shared_ptr<Packet>> lastPage;
+    EXPECT_TRUE(sqliteUtil.queryPacket(lastPage, 10, 4));
+    ASSERT_EQ(lastPage.size(), 1u);
+    EXPECT_EQ(lastPage[0]->frame_number, 5);
+
+    // 默认参数（limit<0）应取全部，且按 frame_number 升序
+    std::vector<std::shared_ptr<Packet>> all;
+    EXPECT_TRUE(sqliteUtil.queryPacket(all));
+    ASSERT_EQ(all.size(), 5u);
+    EXPECT_EQ(all.front()->frame_number, 1);
+    EXPECT_EQ(all.back()->frame_number, 5);
+}
+
 TEST_F(SQLiteUtilTest, SaveQueryResultToFile) {
     // 创建SQLiteUtil实例
     SQLiteUtil sqliteUtil(dbPath);
@@ -237,8 +283,8 @@ TEST_F(SQLiteUtilTest, SaveQueryResultToFile) {
     EXPECT_TRUE(sqliteUtil.insertPacket(packets));
     
     // 创建测试目录
-    system("mkdir -p /tmp/test_data");
-    
+    makeDirs("/tmp/test_data");
+
     // 测试查询和保存结果
     std::map<std::string, std::string> conditions;
     conditions["location"] = "湖南";
