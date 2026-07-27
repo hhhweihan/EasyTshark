@@ -95,7 +95,6 @@ std::string tsharkFromRegistry()
 }
 #endif
 
-// 各平台常见安装目录里的 tshark 候选路径。
 std::vector<std::string> commonTsharkCandidates()
 {
 #if defined(__APPLE__)
@@ -186,7 +185,7 @@ std::vector<AdapterInfo> listNetworkAdapters(const std::string& tsharkPath)
         size_t      endPos   = line.find(" (", startPos);
         std::string interfaceName;
         std::string remark;
-        if (endPos != std::string::npos) // 如果有描述
+        if (endPos != std::string::npos)
         {
             interfaceName = line.substr(startPos, endPos - startPos);
             remark        = line.substr(endPos + 2, line.find(")", endPos) - endPos - 2);
@@ -196,7 +195,6 @@ std::vector<AdapterInfo> listNetworkAdapters(const std::string& tsharkPath)
             interfaceName = line.substr(startPos);
         }
 
-        // 过滤掉需要排除的虚拟网卡
         if (specialInterfaces.find(interfaceName) != specialInterfaces.end())
         {
             continue;

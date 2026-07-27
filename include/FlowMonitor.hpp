@@ -22,11 +22,11 @@ public:
         monitorTsharkPipe = nullptr;
         tsharkPid         = ProcessUtil::kInvalidProc;
     }
-    std::string                  adapterName;       // 网卡名称
-    std::map<long, long>         flowTrendData;     // 流量趋势数据
-    std::shared_ptr<std::thread> monitorThread;     // 负责监控该网卡输出的线程
-    FILE*                        monitorTsharkPipe; // 线程与tshark通信的管道
-    ProcessUtil::ProcHandle      tsharkPid;         // 负责捕获该网卡数据的tshark进程句柄
+    std::string                  adapterName;
+    std::map<long, long>         flowTrendData;
+    std::shared_ptr<std::thread> monitorThread;
+    FILE*                        monitorTsharkPipe;
+    ProcessUtil::ProcHandle      tsharkPid;
     // 单次 read 可能只读到半行、也可能一次读到多行；用它跨 read 暂存未完成的行尾，
     // 凑齐一个 '\n' 再解析，避免丢弃同一 read 里的后续行（旧实现只解析第一行）。
     std::string readLeftover;
@@ -45,22 +45,18 @@ public:
     std::string getTsharkPath() const { return tsharkPath; }
     void        setTsharkPath(const std::string& path) { tsharkPath = path; }
 
-    // 监控所有网卡流量统计数据
     void startMonitorAdaptersFlowTrend();
 
-    // 停止监控所有网卡流量统计数据
     void stopMonitorAdaptersFlowTrend();
 
-    // 获取所有网卡流量统计数据
     void getAdaptersFlowTrendData(std::map<std::string, std::map<long, long>>& flowTrendData);
 
 private:
-    // 监控所有网卡流量趋势的工作线程
     void adapterFlowTrendMonitorThreadEntry();
 
 private:
     std::string tsharkPath;
-    EventPoller flowTrendPoller; // 网卡流量监控的事件轮询器
+    EventPoller flowTrendPoller;
 
     std::map<std::string, AdapterMonitorInfo> adapterFlowTrendMonitorMap;
 

@@ -45,13 +45,11 @@ void FlowMonitor::stopMonitorAdaptersFlowTrend()
     // 第二步：线程已退出，可安全清理监控 map（此时无并发访问）
     std::unique_lock<std::recursive_mutex> lock(adapterFlowTrendMapLock);
 
-    // 先杀死对应的tshark进程
     for (const auto& adapterPipePair : adapterFlowTrendMonitorMap)
     {
         ProcessUtil::Kill(adapterPipePair.second.tsharkPid);
     }
 
-    // 然后关闭管道并从轮询器中移除
     for (auto& adapterPipePair : adapterFlowTrendMonitorMap)
     {
         if (adapterPipePair.second.monitorTsharkPipe)
@@ -111,7 +109,6 @@ void FlowMonitor::getAdaptersFlowTrendData(
 
 void FlowMonitor::startMonitorAdaptersFlowTrend()
 {
-    // 开始监控所有网卡流量统计数据
     std::unique_lock<std::recursive_mutex> lock(adapterFlowTrendMapLock);
 
     adapterFlowTrendMonitorStartTime = time(nullptr);
@@ -121,10 +118,8 @@ void FlowMonitor::startMonitorAdaptersFlowTrend()
     flowTrendPoller.clear();
     fdToAdapter.clear();
 
-    // 第一步：获取网卡列表
     std::vector<AdapterInfo> adapterList = TsharkCommand::listNetworkAdapters(tsharkPath);
 
-    // 第二步：每个网卡启动一个线程，统计对应网卡的数据
     for (const auto& adapter : adapterList)
     {
         adapterFlowTrendMonitorMap.insert(std::make_pair(adapter.name, AdapterMonitorInfo()));
@@ -148,7 +143,6 @@ void FlowMonitor::startMonitorAdaptersFlowTrend()
         int pipeFd = fileno(pipe);
         platform::setPipeNonblocking(pipeFd);
 
-        // 注册到事件轮询器
         if (!flowTrendPoller.add(pipeFd))
         {
             LOG_F(ERROR, "Failed to add pipe to poller for adapter: %s", adapter.name.c_str());
@@ -156,7 +150,6 @@ void FlowMonitor::startMonitorAdaptersFlowTrend()
             continue;
         }
 
-        // 保存管道和进程 ID
         monitorInfo.monitorTsharkPipe = pipe;
         monitorInfo.tsharkPid         = tsharkPid;
 

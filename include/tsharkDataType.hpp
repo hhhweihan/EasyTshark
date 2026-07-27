@@ -9,20 +9,20 @@ struct Packet
 {
     // 类内初始化（C++11）：确保 parseLine 未显式赋值的字段（如无端口的包）
     // 不会残留未定义值被写入数据库
-    int         frame_number = 0; // 数据包编号
-    double      time         = 0.0; // 数据包的时间戳
+    int         frame_number = 0;
+    double      time         = 0.0;
     uint32_t    cap_len      = 0;
     uint32_t    len          = 0;
     std::string src_mac;
     std::string dst_mac;
-    std::string src_ip; // 源IP地址
+    std::string src_ip;
     std::string src_location;
     uint16_t    src_port = 0;
-    std::string dst_ip; // 目的IP地址
+    std::string dst_ip;
     std::string dst_location;
     uint16_t    dst_port = 0;
     std::string protocol;
-    std::string info; // 数据包的概要信息
+    std::string info;
     // 该报文在 pcap 文件中的字节偏移。累计值可超过 4GB，用 64 位避免大文件溢出。
     uint64_t file_offset = 0;
     // 传输层协议（"TCP"/"UDP"/""）：仅内存态、不入库，由 parseLine 依据
@@ -40,7 +40,6 @@ struct DetailNode
     std::vector<DetailNode> children;
 };
 
-// PCAP全局文件头
 struct PcapHeader
 {
     uint32_t magic_number;
@@ -52,7 +51,6 @@ struct PcapHeader
     uint32_t network;
 };
 
-// 每一个数据报文前面的头
 struct PacketHeader
 {
     uint32_t ts_sec;

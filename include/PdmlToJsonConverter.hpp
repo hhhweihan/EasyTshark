@@ -17,14 +17,11 @@ public:
     std::string getTsharkPath() const { return tsharkPath; }
     void        setTsharkPath(const std::string& path) { tsharkPath = path; }
 
-    // 将PCAP文件转换为XML格式
     bool convertPcapToXml(const std::string& pcapFile, const std::string& xmlFile);
 
-    // 将XML文件转换为JSON文件
     bool convertXmlToJson(const std::string& xmlFile, const std::string& jsonFile);
 
 private:
-    // 辅助函数：将XML节点转换为JSON节点
     void convertXmlNodeToJson(rapidxml::xml_node<>* xmlNode, rapidjson::Value& jsonNode,
                               rapidjson::Document::AllocatorType& allocator);
 
