@@ -25,10 +25,8 @@ public:
     // 注销一个 fd。不存在则忽略。
     void remove(int fd);
 
-    // 清空所有已注册的 fd。
     void clear();
 
-    // 当前注册的 fd 数量。
     std::size_t size() const;
 
     // 等待事件，最多阻塞 timeoutMs 毫秒（-1 表示无限等待，0 表示立即返回）。

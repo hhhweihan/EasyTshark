@@ -19,17 +19,14 @@ public:
     explicit PcapAnalyzer(const std::string& tsharkPath,
                           const std::string& ip2RegionDbPath = "resources/ip2region.xdb");
 
-    // 设置 ip2region 数据库路径
     void        setIp2RegionDbPath(const std::string& path) { ip2RegionDbPath = path; }
     std::string getIp2RegionDbPath() const { return ip2RegionDbPath; }
 
     std::string getTsharkPath() const { return tsharkPath; }
     void        setTsharkPath(const std::string& path) { tsharkPath = path; }
 
-    // 分析数据包文件
     bool analysisFile(const std::string& filePath);
 
-    // 分析数据包文件并返回数据包列表
     bool analysisFile(const std::string& filePath, std::vector<std::shared_ptr<Packet>>& packets);
 
     // 流式分析：逐包解析、每解析出一个包就回调 onPacket，**不累积到 allPackets**。
@@ -37,10 +34,8 @@ public:
     // 注意：此重载不填充 allPackets、也不打开随机读取器，故其后 getPacketHexData 不可用。
     bool analysisFile(const std::string& filePath, const std::function<void(const Packet&)>& onPacket);
 
-    // 打印所有数据包的信息
     void printAllPackets();
 
-    // 获取指定编号数据包的十六进制数据
     bool getPacketHexData(uint32_t frameNumber, std::vector<unsigned char>& data);
 
     // 取指定报文的协议分层树（tshark -T pdml 单包解析），供详情面板展开。

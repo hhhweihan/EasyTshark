@@ -17,7 +17,6 @@
 
 PdmlToJsonConverter::PdmlToJsonConverter(const std::string& tsharkPath) : tsharkPath(tsharkPath) {}
 
-// 将XML节点转换为JSON节点
 void PdmlToJsonConverter::convertXmlNodeToJson(rapidxml::xml_node<>* xmlNode,
                                                rapidjson::Value&     jsonNode,
                                                rapidjson::Document::AllocatorType& allocator)
@@ -38,14 +37,12 @@ void PdmlToJsonConverter::convertXmlNodeToJson(rapidxml::xml_node<>* xmlNode,
         jsonNode.AddMember(rapidjson::Value(child->name(), allocator), childJson, allocator);
     }
 
-    // 无子节点时，将节点文本作为字符串值
     if (!hasChildNodes && xmlNode->value_size() > 0)
     {
         jsonNode.SetString(xmlNode->value(), allocator);
     }
 }
 
-// 将PCAP文件转换为XML格式
 bool PdmlToJsonConverter::convertPcapToXml(const std::string& pcapFile, const std::string& xmlFile)
 {
     // 用 argv 方式执行 tshark，父进程读取 pdml 输出并写入 XML 文件，
@@ -84,7 +81,6 @@ bool PdmlToJsonConverter::convertPcapToXml(const std::string& pcapFile, const st
 #endif
 }
 
-// 将XML文件转换为JSON文件
 bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std::string& jsonFile)
 {
     try

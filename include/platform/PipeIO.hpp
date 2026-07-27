@@ -16,7 +16,6 @@ namespace platform
 //   Windows：空操作（读前用 PeekNamedPipe 判断可读量，天然非阻塞）。
 void setPipeNonblocking(int fd);
 
-// 非阻塞读取至多 len 字节到 buf。
 // 返回值语义（三态）：
 //   >0 : 实际读取的字节数；
 //    0 : 当前无数据可读（相当于 POSIX 的 EAGAIN），管道仍打开；

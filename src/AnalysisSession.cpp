@@ -36,7 +36,6 @@ bool ensureDir(const std::string& dir)
     return errno == EEXIST;
 }
 
-// 二进制方式复制文件，成功返回 true
 bool copyFile(const std::string& src, const std::string& dst)
 {
     std::ifstream in(src, std::ios::binary);
