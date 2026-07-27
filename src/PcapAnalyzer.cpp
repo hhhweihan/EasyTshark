@@ -25,7 +25,6 @@ bool PcapAnalyzer::streamPackets(
     const std::string&                                         filePath,
     const std::function<void(const std::shared_ptr<Packet>&)>& onPacket)
 {
-    // 命令 = {tshark, -r, 文件} + 共享字段列表
     std::vector<std::string> tsharkArgs = {tsharkPath, "-r", filePath};
     std::vector<std::string> fieldArgs  = TsharkCommand::tsharkFieldArgs();
     tsharkArgs.insert(tsharkArgs.end(), fieldArgs.begin(), fieldArgs.end());
@@ -62,7 +61,7 @@ bool PcapAnalyzer::streamPackets(
             return false;
         }
 
-        // 记录本包在文件中的偏移，再按 包头 + 抓包长度 前移游标（64 位累加，避免大文件溢出）。
+        // 记录本包偏移，再前移游标到下一包起始（包头 + 抓包长度）
         packet->file_offset = file_offset + sizeof(PacketHeader);
         file_offset         = file_offset + sizeof(PacketHeader) + packet->cap_len;
 

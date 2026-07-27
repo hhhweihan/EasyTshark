@@ -286,7 +286,7 @@ public:
             auto it = cur->children.find(text[i]);
             if (it == cur->children.end())
             {
-                break; // 无法继续沿树下探，停止
+                break;
             }
             cur = it->second.get();
             if (cur->hasValue)
@@ -322,7 +322,6 @@ const TranslationTrie& translationTrie()
     return trie;
 }
 
-// 对 showname 做最长前缀翻译；命中则替换前缀并返回 true
 bool translatePrefix(std::string& showname)
 {
     size_t             matchedLen  = 0;
@@ -749,16 +748,7 @@ bool SQLiteUtil::queryPackets(const std::map<std::string, std::string>& conditio
     return true;
 }
 
-/**
- * @brief 将查询结果保存到JSON文件
- *
- * @param jsonResult JSON格式的查询结果字符串
- * @param filePath 保存文件的路径
- * @return true 保存成功
- * @return false 保存失败
- *
- * @note 如果目标文件已存在，将会被覆盖
- */
+// 若目标文件已存在，将会被覆盖
 bool SQLiteUtil::saveQueryResultToFile(const std::string& jsonResult, const std::string& filePath)
 {
     try

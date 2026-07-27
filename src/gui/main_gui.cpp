@@ -809,7 +809,6 @@ void drawPacketTable(AppState& s)
     if (!s.liveCapturing && s.viewDirty)
         rebuildView(s);
 
-    // 头部信息行
     if (s.liveCapturing)
     {
         ImGui::Text("报文数: %zu", s.packets.size());
@@ -871,7 +870,6 @@ void drawPacketTable(AppState& s)
         ImGui::EndTable();
     }
 
-    // 分页条（非实时）
     if (!s.liveCapturing)
     {
         int totalPages = std::max(1, (int)((s.view.size() + s.pageSize - 1) / s.pageSize));
@@ -998,7 +996,6 @@ void drawSessions(AppState& s)
                           "HTTP会话", "SSL/TLS会话", "SSH会话"};
     ImGui::Combo("##sesscat", &s.sessionCategory, cats, IM_ARRAYSIZE(cats));
 
-    // 先算命中数
     size_t shown = 0;
     for (const SessionInfo& si : s.sessions)
         if (sessionMatches(si, s.sessionCategory))
@@ -1131,7 +1128,6 @@ void drawQuery(AppState& s)
     ImGui::EndChild();
 }
 
-// 底部状态栏：报文总数 / 总字节 / 状态；“关于”弹窗。
 void drawStatusBar(AppState& s)
 {
     ImGui::Separator();
@@ -1225,7 +1221,7 @@ int main(int, char**)
         return 1;
     }
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1); // vsync
+    glfwSwapInterval(1);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
