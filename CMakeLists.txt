@@ -15,6 +15,12 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/output")
 
 file(COPY ${CMAKE_SOURCE_DIR}/resources DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 
+# Web 前端的静态资源（HTML/JS/CSS）随产物一起放到 output/web，供 tshark_web 托管。
+# 仅当 web/ 目录存在时复制，避免裁剪掉前端时报错。
+if(EXISTS "${CMAKE_SOURCE_DIR}/web")
+    file(COPY ${CMAKE_SOURCE_DIR}/web DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
+endif()
+
 # 启用测试
 enable_testing()
 
@@ -146,6 +152,22 @@ if(EXISTS "${EASYTSHARK_GLFW_DIR}/CMakeLists.txt" AND EXISTS "${EASYTSHARK_IMGUI
     endif()
 else()
     message(STATUS "third_party/glfw 或 third_party/imgui 未就位，跳过 GUI 目标 tshark_gui")
+endif()
+
+# ---- Web 前端（第三个前端：headless 服务器 + 浏览器远程访问）----
+# 以 cpp-httplib（vendored 单头文件 third_party/httplib/httplib.h）实现一个 HTTP 服务：
+# 对外暴露 REST/JSON API + 托管 web/ 静态前端。核心逻辑仍全在 AnalysisSession 门面里，
+# 本目标只是第三个薄入口（与 CLI/GUI 并列）。httplib 未就位时跳过，保证其余目标可独立构建。
+# httplib 依赖：posix 需 pthread、Windows 需 ws2_32——两者都已在 tshark_lib 链接，无需重复。
+set(EASYTSHARK_HTTPLIB "${CMAKE_SOURCE_DIR}/third_party/httplib/httplib.h")
+if(EXISTS "${EASYTSHARK_HTTPLIB}")
+    add_executable(tshark_web src/web/main_web.cpp)
+    target_link_libraries(tshark_web tshark_lib)
+    if(MSVC)
+        target_compile_options(tshark_web PRIVATE /utf-8) # main_web.cpp 含中文注释
+    endif()
+else()
+    message(STATUS "third_party/httplib 未就位，跳过 Web 目标 tshark_web")
 endif()
 
 # 添加测试子目录

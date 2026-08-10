@@ -9,7 +9,14 @@ test_data/*
 output/tshark_main
 output/unit_tests
 output/tshark_gui
+output/tshark_web
 output/*.exe
+
+# 构建产物：Web 前端静态资源由 CMake 从源码树 web/ 复制到 output/web，不纳入版本控制
+output/web/
+
+# clangd / 编辑器缓存
+.cache/
 
 # 运行时产物：GUI 布局、日志、抓包输出，均为本地运行生成，不纳入版本控制
 imgui.ini

@@ -122,10 +122,9 @@ FILE* spawnWithPipe(const std::string& cmdline, ProcessUtil::ProcHandle* pidOut,
     mutableCmd.push_back('\0');
 
     // CREATE_NEW_PROCESS_GROUP：让子进程自成进程组，为将来用 GenerateConsoleCtrlEvent
-    // 做“优雅停止”预留可能（当前 Kill 仍用 TerminateProcess）。
-    // CREATE_NO_WINDOW：tshark 是控制台程序，当父进程是 GUI（Windows 子系统、自身无控制台）
-    // 时，子进程会新建一个黑色控制台窗口弹出来。加此标志令子进程不创建/显示任何控制台窗口；
-    // 我们只经匿名管道读取它的 stdout，功能不受影响。仅 Windows 相关，POSIX 走另一分支。
+    // 做优雅停止预留可能（当前 Kill 仍用 TerminateProcess）。
+    // CREATE_NO_WINDOW：父进程是 GUI 时，控制台程序 tshark 会弹出黑色控制台窗口；
+    // 加此标志令其不创建控制台。我们只经匿名管道读它的 stdout，功能不受影响。
     BOOL ok = CreateProcessA(nullptr, mutableCmd.data(), nullptr, nullptr,
                              TRUE, // 继承句柄（含上面可继承的 childEnd）
                              CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, nullptr, nullptr, &si,
