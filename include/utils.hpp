@@ -1,12 +1,10 @@
 #ifndef utils_hpp
 #define utils_hpp
 
-#include <chrono>
-#include <iomanip>
 #include <map>
 #include <memory>
 #include <string>
-#include <unordered_map>
+#include <vector>
 
 #include "rapidjson/document.h"
 
@@ -43,6 +41,15 @@ public:
 
     static void translateShowNameFields(rapidjson::Value&                   value,
                                         rapidjson::Document::AllocatorType& allocator);
+
+    /**
+     * @brief 把一批报文序列化为 JSON 字符串（{"total":N,"packets":[...]}）
+     *
+     * 从 SQLiteUtil 的查询序列化中抽出，供多个前端复用：查询结果（CLI/GUI）与
+     * Web 层的 /api/packets 都用同一份字段约定，避免重复实现导致口径漂移。
+     * 只读取 packets（内部用 StringRef 引用其字符串内存），序列化期间入参须存活。
+     */
+    static std::string packetsToJson(const std::vector<std::shared_ptr<Packet>>& packets);
 };
 
 /**
@@ -101,8 +108,6 @@ private:
         std::string text;     // Type == Text 时有效
         int         intValue; // Type == Int 时有效
     };
-
-    std::string packetsToJson(std::vector<std::shared_ptr<Packet>>& packets);
 
     /**
      * @param params 输出参数，按 `?` 出现顺序收集需要绑定的值

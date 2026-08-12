@@ -6,10 +6,8 @@ namespace PacketParser
 {
 namespace
 {
-// 在 [p, end) 区间上按十进制整数解析：要求至少消费一个数字，否则视为失败
-// （与原先 std::stoi 对空串 / 非数字抛异常 → 返回 false 的语义一致）。
-// 数字字段后面必然跟着 '\t' 或字符串结尾（c_str 以 '\0' 收尾），strtol 天然在
-// 分隔符处停下，无需先把字段拷成独立的、以 '\0' 结尾的字符串。
+// [p,end) 内解析十进制整数；至少消费一个数字才算成功。
+// strtol 在 '\t'/'\0' 处自然停下，无需先把字段拷成独立字符串。
 bool parseLongField(const char* p, const char* end, long& out)
 {
     if (p >= end)
@@ -46,16 +44,16 @@ bool parseDoubleField(const char* p, const char* end, double& out)
 
 bool parseLine(const std::string& rawLine, Packet& packet)
 {
-    // 直接在 rawLine 上按有效长度切分，避免为了去掉末尾 '\n' 而整行复制一份
+    // 就地在 rawLine 上按有效长度切分，避免为去掉末尾 '\n' 整行复制
     size_t lineLen = rawLine.size();
     if (lineLen > 0 && rawLine[lineLen - 1] == '\n')
     {
         --lineLen;
     }
 
-    // 只记录每个字段的 [start,end) 边界，而不是一上来就为 16 个字段各分配一个 std::string。
-    // 数字字段（0-3、10-13）只需就地解析、用完即弃，避免“分配一个字符串马上又丢掉”的浪费；
-    // 只有真正要存进 Packet 的文本字段（4-9、14、15）才在最后 substr 出来。
+    // 只记录各字段的 [start,end) 边界，不为 16 个字段预先各分配一个 string：
+    // 数字字段（0-3、10-13）就地解析用完即弃，只有要存进 Packet 的文本字段
+    // （4-9、14、15）才在最后 substr 出来。
     struct Span
     {
         size_t start;
@@ -94,8 +92,8 @@ bool parseLine(const std::string& rawLine, Packet& packet)
     auto        substr  = [&](int i)
     { return rawLine.substr(spans[i].start, spans[i].end - spans[i].start); };
 
-    // 数字字段就地解析：任意一个必填数字字段非法（空/非数字）即判定整行解析失败，
-    // 绝不让异常沿 streamPackets → analysisFile → std::async 的 future 冒泡到 UI 线程。
+    // 数字字段就地解析：任一必填数字字段非法（空/非数字）即整行失败，
+    // 不让异常沿 streamPackets 冒泡到 UI 线程。
     long tmp = 0;
     if (!parseLongField(spanPtr(0), spanEnd(0), tmp))
     {
@@ -137,14 +135,14 @@ bool parseLine(const std::string& rawLine, Packet& packet)
         packet.dst_port = static_cast<uint16_t>(tmp);
     }
 
-    // 文本字段才真正 substr 出来存入 Packet（临时串直接移动赋值，无额外拷贝）
+    // 文本字段才 substr 出来存入 Packet（临时串移动赋值，无额外拷贝）
     packet.src_mac = substr(4);
     packet.dst_mac = substr(5);
     // IPv4 为空时回退到 IPv6 字段
     packet.src_ip = !isEmpty(6) ? substr(6) : substr(7);
     packet.dst_ip = !isEmpty(8) ? substr(8) : substr(9);
-    // 传输层：tcp.* 字段非空即 TCP，否则 udp.* 非空即 UDP，都空则留空。
-    // 仅供会话视图区分，不影响 src_port/dst_port（二者已合并取值）。
+    // 传输层：tcp.* 非空即 TCP，否则 udp.* 非空即 UDP。仅供会话视图区分，
+    // 不影响 src_port/dst_port（二者已合并取值）。
     if (!isEmpty(10) || !isEmpty(12))
     {
         packet.transport = "TCP";

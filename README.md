@@ -2,7 +2,7 @@
 
 本仓库是 EasyTshark 的 **C++ 版本**，从零用 C++11 重写核心抓包与分析逻辑，供学习网络编程、进程管理、SQLite 集成参考。社区正式版由 **“轩辕之风”老师** 维护，见 [easytshark.com](https://www.easytshark.com/)。
 
-EasyTshark 基于 tshark，支持实时抓包与离线 PCAP 分析、SQLite 存储、XML/JSON 格式转换，提供**命令行**与**原生图形界面**两种前端。
+EasyTshark 基于 tshark，支持实时抓包与离线 PCAP 分析、SQLite 存储、XML/JSON 格式转换，提供**命令行**、**原生图形界面**与**Web 界面**三种前端。
 
 > 早期未完成的实现（仅含后端部分，无 GUI）保存在 [`feature/V1`](../../tree/feature/V1) 分支；当前主线是重构后的完整版本。
 
@@ -11,7 +11,7 @@ EasyTshark 基于 tshark，支持实时抓包与离线 PCAP 分析、SQLite 存�
 ## 功能特点
 
 - **双模式**：实时抓包（从网卡捕获）/ 离线分析（解析已有 PCAP 文件）
-- **双前端**：命令行 `tshark_main`（交互式菜单）/ 图形界面 `tshark_gui`（Dear ImGui，包列表 / 十六进制 / 协议详情树 / 显示过滤）
+- **三前端**：命令行 `tshark_main`（交互式菜单）/ 图形界面 `tshark_gui`（Dear ImGui，包列表 / 十六进制 / 协议详情树 / 显示过滤）/ Web 界面 `tshark_web`（headless 服务器上跑引擎，浏览器远程访问同一套富界面）
 - **数据存储**：捕获的数据包存入 SQLite，支持快速查询
 - **格式转换**：PCAP → tshark PDML(XML) → JSON
 - **IP 地理位置**：基于 ip2region 自动解析归属地
@@ -20,12 +20,11 @@ EasyTshark 基于 tshark，支持实时抓包与离线 PCAP 分析、SQLite 存�
 
 ## 架构
 
-程序以 **`AnalysisSession`（门面）** 为唯一入口，对上服务 CLI / GUI 两种前端，对下装配各职责单一的模块：
+程序以 **`AnalysisSession`（门面）** 为唯一入口，对上服务 CLI / GUI / Web 三种前端，对下装配各职责单一的模块：
 
 | 组件 | 职责 |
 |------|------|
-| `AnalysisSession` | 门面：装配并协调下列模块 |
-| `LiveCapture` | 实时抓包（tshark 子进程 + `EventPoller` 非阻塞读） |
+| `AnalysisSession` | 门面：装配并协调下列模块 || `LiveCapture` | 实时抓包（tshark 子进程 + `EventPoller` 非阻塞读） |
 | `PcapAnalyzer` | 离线 PCAP 解析、格式转换调度 |
 | `PacketParser` | 将 tshark 的 fields 文本行解析为 `Packet` |
 | `PcapFileReader` | 按偏移随机读取 PCAP 原始字节（POSIX `mmap` / `ifstream` 回退） |
@@ -35,7 +34,7 @@ EasyTshark 基于 tshark，支持实时抓包与离线 PCAP 分析、SQLite 存�
 | `SQLiteUtil` / `IP2RegionUtil` | 数据入库与查询 / IP 归属地解析 |
 | `ProcessUtil` / `EventPoller` | 子进程创建回收 / I/O 多路复用抽象 |
 
-安全要点：子进程调用统一走 `ProcessUtil::PopenEx` 的参数向量方式（`execvp`，不经 `/bin/sh`），避免 shell 注入；SQL 查询统一走 `sqlite3_bind_*` 参数化绑定，避免 SQL 注入。
+安全要点：子进程调用统一走 `ProcessUtil::PopenEx` 的参数向量方式（`execvp`，不经 `/bin/sh`），避免 shell 注入；SQL 查询统一走 `sqlite3_bind_*` 参数化绑定，避免 SQL 注入。Web 服务默认只绑 `127.0.0.1`（远程访问走 SSH 端口转发，勿裸绑 `0.0.0.0`——该服务会驱动特权抓包）。
 
 ## 系统要求
 
@@ -45,7 +44,7 @@ EasyTshark 基于 tshark，支持实时抓包与离线 PCAP 分析、SQLite 存�
 
 ## 依赖库
 
-以下库以 vendored 源码形式随仓库提供（`third_party/`），首次 clone 后即可离线构建：sqlite3、loguru、rapidjson、rapidxml、ip2region、Dear ImGui + GLFW（GUI 依赖，未就位时 CMake 会自动跳过 `tshark_gui` 目标）。
+以下库以 vendored 源码形式随仓库提供（`third_party/`），首次 clone 后即可离线构建：sqlite3、loguru、rapidjson、rapidxml、ip2region、Dear ImGui + GLFW（GUI 依赖，未就位时 CMake 会自动跳过 `tshark_gui` 目标）、cpp-httplib（Web 依赖，单头文件，未就位时自动跳过 `tshark_web` 目标）。
 
 ## 安装与构建
 
@@ -71,14 +70,30 @@ cd EasyTshark
 
 Windows 下在普通 `cmd`（非 Git Bash）中运行 `scripts\build_windows.bat`。
 
-构建产物输出到 `output/`：`tshark_main`（CLI）、`tshark_gui`（GUI，依赖就位时）、`unit_tests`。
+构建产物输出到 `output/`：`tshark_main`（CLI）、`tshark_gui`（GUI，依赖就位时）、`tshark_web`（Web，依赖就位时）、`unit_tests`。
 
 ## 使用方法
 
 ```bash
 ./output/tshark_main   # 命令行版：按提示选择实时抓包/离线分析，解析入库后可选查询
 ./output/tshark_gui    # 图形界面版：打开 PCAP 或启动抓包，浏览包列表/十六进制/协议树，支持显示过滤
+./output/tshark_web    # Web 版：启动 HTTP 服务（默认 127.0.0.1:8080），浏览器访问同一套富界面
 ```
+
+**Web 版说明**：适合把抓包/分析引擎跑在无图形界面的服务器上、从自己电脑的浏览器远程使用。
+
+```bash
+./output/tshark_web                      # 默认 http://127.0.0.1:8080
+./output/tshark_web --host 127.0.0.1 --port 9000   # 自定义 host/port（也可用环境变量 EASYTSHARK_WEB_HOST/PORT）
+```
+
+远程访问请用 SSH 端口转发，**不要**把服务裸绑到 `0.0.0.0`（本服务会驱动特权抓包）：
+
+```bash
+ssh -L 8080:127.0.0.1:8080 user@server   # 本机浏览器开 http://127.0.0.1:8080 即可
+```
+
+页面上：填服务器端 PCAP 路径「载入并分析」做离线分析；或「刷新网卡 → 选网卡 → 开始抓包」做实时抓包（边抓边刷新），停止后可看协议详情/十六进制。会话与统计在前端聚合，与 GUI 口径一致。
 
 输出文件位于 `data/`：`pcaps/capture_<时间戳>.pcap`（抓包）、`pcaps/packets_<时间戳>.db`（SQLite）、`packets.xml`（PDML）、`packets.json`。`data/` 与 `logs/` 为运行时生成目录，已 gitignore。
 
@@ -99,7 +114,8 @@ Windows 下在普通 `cmd`（非 Git Bash）中运行 `scripts\build_windows.bat
 ├── CMakeLists.txt
 ├── scripts/build_unix.sh / build_windows.bat
 ├── include/            # 第一方头文件
-├── src/                # 第一方源文件（main.cpp / gui/main_gui.cpp 为两个入口）
+├── src/                # 第一方源文件（main.cpp / gui/main_gui.cpp / web/main_web.cpp 为三个入口）
+├── web/                # Web 前端静态资源（index.html / app.js / style.css）
 ├── third_party/        # vendored 第三方库
 ├── tests/              # 单元测试
 ├── resources/          # 运行所需资源（ip2region.xdb）

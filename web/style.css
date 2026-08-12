@@ -1,0 +1,98 @@
+/* EasyTshark Web 前端样式：深色主题，呼应原生 GUI（Dear ImGui Dark）的观感。 */
+* { box-sizing: border-box; }
+html, body {
+    margin: 0; height: 100%;
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 13px; color: #d7d7db; background: #1a1a1f;
+}
+body { display: flex; flex-direction: column; }
+
+/* 工具栏 / 过滤栏 */
+.toolbar, .filterbar {
+    display: flex; flex-wrap: wrap; gap: 14px; align-items: center;
+    padding: 8px 12px; background: #22222a; border-bottom: 1px solid #34343e;
+}
+.tool-group { display: flex; gap: 6px; align-items: center; }
+.label { color: #9a9aa6; font-size: 12px; }
+.hint { font-size: 12px; }
+
+input[type=text], input:not([type]), select {
+    background: #16161b; color: #e4e4ea; border: 1px solid #3a3a46;
+    border-radius: 4px; padding: 4px 7px; font-size: 13px; outline: none;
+}
+input:focus, select:focus { border-color: #4a86e8; }
+button {
+    background: #2f2f3a; color: #e4e4ea; border: 1px solid #444452;
+    border-radius: 4px; padding: 5px 12px; cursor: pointer; font-size: 13px;
+}
+button:hover:not(:disabled) { background: #3a3a48; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+
+/* 主分页栏 */
+.tabs { display: flex; gap: 2px; padding: 6px 12px 0; background: #22222a; }
+.tab {
+    border: none; border-bottom: 2px solid transparent; border-radius: 0;
+    background: transparent; color: #9a9aa6; padding: 7px 16px;
+}
+.tab.active { color: #fff; border-bottom-color: #4a86e8; }
+
+.main { flex: 1; overflow: hidden; padding: 10px 12px; }
+.tabpage { display: none; height: 100%; flex-direction: column; }
+.tabpage.active { display: flex; }
+
+/* 报文页布局：左列表 62% / 右详情 */
+.packets-layout { display: flex; gap: 10px; height: 100%; }
+.packets-list { flex: 0 0 62%; display: flex; flex-direction: column; min-width: 0; }
+.packets-detail { flex: 1; display: flex; flex-direction: column; min-width: 0;
+    background: #16161b; border: 1px solid #2e2e38; border-radius: 6px; padding: 8px; overflow: hidden; }
+.packets-detail h3 { margin: 4px 0 6px; font-size: 13px; color: #9ab; font-weight: 600; }
+
+.list-header { display: flex; align-items: center; gap: 14px; padding: 2px 2px 6px; }
+.live-dot { color: #4ade4a; font-weight: 600; }
+.autoscroll { color: #9a9aa6; }
+
+/* 表格 */
+.table-scroll { flex: 1; overflow: auto; border: 1px solid #2e2e38; border-radius: 6px; }
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+thead th {
+    position: sticky; top: 0; background: #2a2a34; color: #c8c8d2;
+    text-align: left; padding: 6px 8px; border-bottom: 1px solid #3a3a46; white-space: nowrap;
+}
+tbody td { padding: 4px 8px; border-bottom: 1px solid #26262e; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; max-width: 380px; }
+tbody tr:hover { background: #26263040; }
+tbody tr.selected { background: #2d4a7a55; }
+tbody tr { cursor: default; }
+.packets-list tbody tr { cursor: pointer; }
+
+.tag-private { color: #7a7a86; font-size: 11px; margin-left: 4px; }
+.proto { font-weight: 600; }
+
+/* 分页 */
+.pager, .subbar, .query-form { display: flex; align-items: center; gap: 10px; padding: 8px 2px; }
+.subbar { padding-bottom: 10px; }
+.query-form { flex-wrap: wrap; }
+.query-form label { display: flex; align-items: center; gap: 5px; color: #9a9aa6; }
+.stat-tab { background: transparent; border: 1px solid #3a3a46; }
+.stat-tab.active { background: #2d4a7a; border-color: #4a86e8; color: #fff; }
+
+/* 详情：协议树 + hex */
+.detail-tree { flex: 1; overflow: auto; font-size: 12.5px; line-height: 1.5;
+    background: #101015; border: 1px solid #2e2e38; border-radius: 4px; padding: 6px; margin-bottom: 8px; }
+.detail-tree ul { list-style: none; margin: 0; padding-left: 16px; }
+.detail-tree li { margin: 1px 0; }
+.detail-tree .node { cursor: pointer; }
+.detail-tree .node::before { content: "▶ "; color: #6a8; font-size: 10px; }
+.detail-tree .node.open::before { content: "▼ "; }
+.detail-tree .leaf { color: #cdd6e0; }
+.detail-tree .leaf::before { content: "• "; color: #567; }
+.detail-tree .val { color: #e0b060; }
+
+.hex-dump { flex: 0 0 40%; overflow: auto; margin: 0; padding: 6px;
+    background: #101015; border: 1px solid #2e2e38; border-radius: 4px;
+    font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: #b8c0c8; }
+
+/* 状态栏 */
+.statusbar { display: flex; gap: 22px; padding: 6px 12px;
+    background: #22222a; border-top: 1px solid #34343e; color: #9a9aa6; font-size: 12px; }
+#statMsg { margin-left: auto; }

@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EasyTshark · Web</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <!-- 工具栏：载入 pcap / 实时抓包 / tshark 路径 -->
+    <div class="toolbar">
+        <div class="tool-group">
+            <span class="label">分析文件</span>
+            <input id="pcapPath" type="text" placeholder="服务器端 PCAP 路径，如 data/pcaps/xxx.pcap" size="42">
+            <button id="btnLoad">载入并分析</button>
+        </div>
+        <div class="tool-group">
+            <span class="label">实时抓包</span>
+            <button id="btnRefreshAdapters">刷新网卡</button>
+            <select id="adapterSelect"><option value="">选择网卡</option></select>
+            <button id="btnStart">开始抓包</button>
+            <button id="btnStop" disabled>停止并分析</button>
+        </div>
+        <div class="tool-group">
+            <span class="label">tshark</span>
+            <input id="tsharkPath" type="text" placeholder="tshark 可执行文件完整路径" size="34">
+            <button id="btnApplyTshark">应用</button>
+            <span id="tsharkState" class="hint"></span>
+        </div>
+    </div>
+
+    <!-- 过滤栏：tshark 显示过滤表达式 + 协议快速分类 -->
+    <div class="filterbar">
+        <input id="filterExpr" type="text" placeholder="显示过滤表达式，如 tcp.port==80 && ip.addr==1.2.3.4" size="46">
+        <button id="btnFilter">查找</button>
+        <button id="btnClearFilter">清除过滤</button>
+        <span class="label">分类</span>
+        <select id="protoCategory">
+            <option value="0">全部数据包</option>
+            <option value="1">ARP</option>
+            <option value="2">ICMP</option>
+            <option value="3">ICMPv6</option>
+        </select>
+    </div>
+
+    <!-- 主分页 -->
+    <div class="tabs">
+        <button class="tab active" data-tab="packets">报文</button>
+        <button class="tab" data-tab="sessions">通信会话</button>
+        <button class="tab" data-tab="stats">统计分析</button>
+        <button class="tab" data-tab="query">查询</button>
+    </div>
+
+    <div class="main">
+        <!-- 报文页：左列表 / 右详情 -->
+        <section id="tab-packets" class="tabpage active">
+            <div class="packets-layout">
+                <div class="packets-list">
+                    <div class="list-header">
+                        <span id="packetsCount">共 0 条</span>
+                        <span id="liveIndicator" class="live-dot" style="display:none">● 实时抓包中</span>
+                        <label class="autoscroll"><input type="checkbox" id="autoScroll" checked> 自动滚动</label>
+                    </div>
+                    <div class="table-scroll">
+                        <table id="packetsTable">
+                            <thead>
+                                <tr>
+                                    <th>No.</th><th>时间</th><th>源</th><th>源归属地</th><th>源端口</th>
+                                    <th>目的</th><th>目的归属地</th><th>目的端口</th><th>协议</th><th>大小</th><th>信息</th>
+                                </tr>
+                            </thead>
+                            <tbody id="packetsBody"></tbody>
+                        </table>
+                    </div>
+                    <div class="pager" id="pager">
+                        <button id="btnPrev">上一页</button>
+                        <span id="pageInfo">第 1 / 1 页</span>
+                        <button id="btnNext">下一页</button>
+                        <span class="label">每页</span>
+                        <select id="pageSize">
+                            <option>50</option><option selected>100</option><option>200</option><option>500</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="packets-detail">
+                    <h3>协议分层</h3>
+                    <div id="detailTree" class="detail-tree">（选中一个报文查看详情）</div>
+                    <h3 id="hexTitle">十六进制</h3>
+                    <pre id="hexDump" class="hex-dump"></pre>
+                </div>
+            </div>
+        </section>
+
+        <!-- 会话页 -->
+        <section id="tab-sessions" class="tabpage">
+            <div class="subbar">
+                <span class="label">会话类型</span>
+                <select id="sessionCategory">
+                    <option value="0">全部会话</option><option value="1">TCP会话</option>
+                    <option value="2">UDP会话</option><option value="3">DNS会话</option>
+                    <option value="4">HTTP会话</option><option value="5">SSL/TLS会话</option>
+                    <option value="6">SSH会话</option>
+                </select>
+                <span id="sessionCount"></span>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead><tr><th>端点 A</th><th>端点 B</th><th>传输层</th><th>协议</th><th>包数</th><th>字节</th></tr></thead>
+                    <tbody id="sessionsBody"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- 统计页 -->
+        <section id="tab-stats" class="tabpage">
+            <div class="subbar">
+                <button class="stat-tab active" data-stat="ip">IP统计</button>
+                <button class="stat-tab" data-stat="proto">协议统计</button>
+                <button class="stat-tab" data-stat="loc">国家统计</button>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead><tr><th id="statNameCol">IP 地址</th><th>包数</th><th>字节</th></tr></thead>
+                    <tbody id="statsBody"></tbody>
+                </table>
+            </div>
+        </section>
+
+        <!-- 查询页 -->
+        <section id="tab-query" class="tabpage">
+            <div class="query-form">
+                <label>MAC <input id="qMac" placeholder="如 00:11:22:*"></label>
+                <label>IP <input id="qIp" placeholder="如 192.168.*"></label>
+                <label>端口 <input id="qPort" placeholder="如 80*"></label>
+                <label>归属地 <input id="qLoc" placeholder="如 深圳*"></label>
+                <button id="btnQuery">查询</button>
+            </div>
+            <div class="table-scroll">
+                <table>
+                    <thead><tr><th>No.</th><th>源IP</th><th>源端口</th><th>目的IP</th><th>目的端口</th><th>协议</th><th>归属地</th><th>信息</th></tr></thead>
+                    <tbody id="queryBody"></tbody>
+                </table>
+            </div>
+        </section>
+    </div>
+
+    <!-- 状态栏 -->
+    <div class="statusbar">
+        <span id="statTotal">数据包总数: 0</span>
+        <span id="statBytes">总字节数: 0</span>
+        <span id="statMsg">状态: 就绪</span>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

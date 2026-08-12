@@ -8,6 +8,7 @@
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "loguru/loguru.hpp"
@@ -121,9 +122,8 @@ std::string IP2RegionUtil::getIpLocation(const std::string& ip)
         return "";
     }
 
-    // 记忆化：真实流量里少数 IP 贡献了绝大多数报文（工作集小、调用量大），命中缓存即可
-    // 跳过 xdb 二分查找与 parseLocation 的分配。离线分析与抓包线程可能并发调用，用一把
-    // 静态 mutex 守护；未命中时的锁开销远小于一次查表+解析，命中时几乎零成本。
+    // 记忆化：少数 IP 贡献绝大多数报文，命中缓存即跳过 xdb 查表与 parseLocation 分配。
+    // 离线分析与抓包线程可能并发调用，用静态 mutex 守护。
     static std::unordered_map<std::string, std::string> locationCache;
     static std::mutex                                    cacheMutex;
     {
@@ -158,7 +158,7 @@ std::string IP2RegionUtil::parseLocation(const std::string& input)
     }
 
     // 按 '|' 切分为「国家|区域|省份|城市|ISP」5 段。手动扫描按需 substr，
-    // 避免 std::stringstream + getline 每次调用都构造流对象、逐字符搬运的额外开销。
+    // 免去 stringstream + getline 每次构造流对象的开销。
     std::string tokens[5];
     int         count = 0;
     size_t      start = 0;
@@ -200,11 +200,9 @@ std::string IP2RegionUtil::parseLocation(const std::string& input)
 
 bool IP2RegionUtil::init(const std::string& xdbFilePath)
 {
-    // 只初始化一次：xdb 文件较大，且离线分析线程与抓包线程都会调用 init，
-    // 用 call_once 保证仅加载一次，既避免每次分析重复加载，也消除并发重设
-    // 静态 xdbPtr 的数据竞争。call_once 完成对所有调用线程建立 happens-before，
-    // 之后各线程读 xdbPtr 都是安全的。加载失败时把 xdbPtr 置空并返回 false，
-    // 绝不让异常沿离线分析路径冒泡到 UI 线程。
+    // 只初始化一次：xdb 文件较大，离线分析与抓包线程都会调用 init。call_once
+    // 保证仅加载一次，并对所有调用线程建立 happens-before，之后读 xdbPtr 皆安全。
+    // 加载失败置空并返回 false，不让异常沿离线分析路径冒泡到 UI 线程。
     static std::once_flag initFlag;
     std::call_once(initFlag,
                    [&xdbFilePath]()
@@ -249,13 +247,9 @@ std::string CommonUtil::get_timestamp()
 
 namespace
 {
-// 前缀树（trie）：把翻译词典按字符逐层展开成一棵树，用于在 O(待匹配串长度) 内
-// 找出 showname 的“最长匹配前缀”。
-//
-// 原实现对约 80 条词典逐条做 showname.find(key) == 0：
-//   - find 会在整串中查找 key，实为 O(串长 × 词典大小) 的重复扫描；
-//   - 遍历的是 unordered_map，命中顺序不确定，多个前缀都能匹配时结果不稳定。
-// 改用 trie 后：只需顺着 showname 走一遍，且总是选中最长（最具体）的前缀，结果确定。
+// 前缀树（trie）：在 O(待匹配串长) 内找出 showname 的最长匹配前缀。
+// 取代原先对约 80 条词典逐条 find(key)==0 的 O(串长×词典大小) 扫描，
+// 且总是选中最长（最具体）的前缀，结果确定。
 class TranslationTrie
 {
 public:
@@ -385,13 +379,12 @@ SQLiteUtil::SQLiteUtil(const std::string& dbname)
         throw std::runtime_error("Failed to open database");
     }
 
-    // 性能取舍：这个库是可从 pcap 随时重建的「派生缓存」，不需要为掉电持久化付出
-    // 每次 COMMIT 都 fsync 回滚日志 + 数据文件的代价。fsync 是把数据强制刷到物理盘的
-    // 屏障，会让入库流水线卡在磁盘 I/O 上；实时抓包多批次入库时这笔开销尤其明显。
-    //   - journal_mode=MEMORY：回滚日志放内存，省去日志文件的创建与 fsync；
+    // 该库是可从 pcap 随时重建的「派生缓存」，无需为掉电持久化付出每次 COMMIT
+    // 都 fsync 的代价（fsync 会让入库流水线卡在磁盘 I/O 上）：
+    //   - journal_mode=MEMORY：回滚日志放内存，省去日志文件创建与 fsync；
     //   - synchronous=OFF：COMMIT 不再 fsync（掉电可能损坏，但源头 pcap 仍在，可重建）；
     //   - temp_store=MEMORY：临时表/索引走内存。
-    // 这些 PRAGMA 失败只会退化回更慢但同样正确的默认行为，不影响功能，故不因此中断构造。
+    // PRAGMA 失败只会退回更慢但同样正确的默认行为，故不因此中断构造。
     sqlite3_exec(db, "PRAGMA journal_mode = MEMORY;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA synchronous = OFF;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", nullptr, nullptr, nullptr);
@@ -465,10 +458,9 @@ bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
     bool hasError = false;
     for (const auto& packet : packets)
     {
-        // 绑定文本列时传入显式字节长度（.size()）而非 -1：-1 会让 SQLite 对每个
-        // 字符串各做一次 strlen 扫描，批量插入 N 包 × 8 列即 8N 次全串扫描。std::string
-        // 已知长度，直接给出可省去这些扫描；SQLITE_STATIC 表示不拷贝，字符串由 packet
-        // 在本次事务结束前持有，保证有效。
+        // 文本列传入显式长度（.size()）而非 -1：-1 会让 SQLite 对每串各做一次
+        // strlen，批量 N 包 × 8 列即 8N 次全串扫描。SQLITE_STATIC 表示不拷贝，
+        // 字符串由 packet 在本次事务结束前持有。
         sqlite3_bind_int(stmt, 1, packet->frame_number);
         sqlite3_bind_double(stmt, 2, packet->time);
         sqlite3_bind_int(stmt, 3, packet->cap_len);
@@ -652,7 +644,7 @@ std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>
     return sql;
 }
 
-std::string SQLiteUtil::packetsToJson(std::vector<std::shared_ptr<Packet>>& packets)
+std::string CommonUtil::packetsToJson(const std::vector<std::shared_ptr<Packet>>& packets)
 {
     rapidjson::Document document;
     document.SetObject();
@@ -743,7 +735,7 @@ bool SQLiteUtil::queryPackets(const std::map<std::string, std::string>& conditio
 
     sqlite3_finalize(stmt);
 
-    jsonResult = packetsToJson(packets);
+    jsonResult = CommonUtil::packetsToJson(packets);
 
     return true;
 }
