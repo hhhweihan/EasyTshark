@@ -6,8 +6,7 @@ namespace PacketParser
 {
 namespace
 {
-// [p,end) 内解析十进制整数；至少消费一个数字才算成功。
-// strtol 在 '\t'/'\0' 处自然停下，无需先把字段拷成独立字符串。
+// [p,end) 内解析十进制整数（strtol 在 '\t'/'\0' 处自然停下，无需拷贝字段）。
 bool parseLongField(const char* p, const char* end, long& out)
 {
     if (p >= end)
@@ -51,9 +50,8 @@ bool parseLine(const std::string& rawLine, Packet& packet)
         --lineLen;
     }
 
-    // 只记录各字段的 [start,end) 边界，不为 16 个字段预先各分配一个 string：
-    // 数字字段（0-3、10-13）就地解析用完即弃，只有要存进 Packet 的文本字段
-    // （4-9、14、15）才在最后 substr 出来。
+    // 只记录各字段的 [start,end) 边界，不为 16 个字段预先各分配 string：
+    // 数字字段就地解析用完即弃，只有要存进 Packet 的文本字段才在最后 substr 出来。
     struct Span
     {
         size_t start;
@@ -92,8 +90,7 @@ bool parseLine(const std::string& rawLine, Packet& packet)
     auto        substr  = [&](int i)
     { return rawLine.substr(spans[i].start, spans[i].end - spans[i].start); };
 
-    // 数字字段就地解析：任一必填数字字段非法（空/非数字）即整行失败，
-    // 不让异常沿 streamPackets 冒泡到 UI 线程。
+    // 数字字段就地解析：任一必填数字字段非法（空/非数字）即整行失败。
     long tmp = 0;
     if (!parseLongField(spanPtr(0), spanEnd(0), tmp))
     {
@@ -141,8 +138,7 @@ bool parseLine(const std::string& rawLine, Packet& packet)
     // IPv4 为空时回退到 IPv6 字段
     packet.src_ip = !isEmpty(6) ? substr(6) : substr(7);
     packet.dst_ip = !isEmpty(8) ? substr(8) : substr(9);
-    // 传输层：tcp.* 非空即 TCP，否则 udp.* 非空即 UDP。仅供会话视图区分，
-    // 不影响 src_port/dst_port（二者已合并取值）。
+    // 传输层：tcp.* 非空即 TCP，否则 udp.* 非空即 UDP；仅供会话视图区分，不影响端口取值。
     if (!isEmpty(10) || !isEmpty(12))
     {
         packet.transport = "TCP";

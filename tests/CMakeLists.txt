@@ -6,6 +6,9 @@ set(TEST_SOURCES
     test_performance.cpp
     test_offline_analysis.cpp
     test_packet_parser.cpp
+    test_web_api.cpp
+    test_live_capture.cpp
+    test_native_engine.cpp
 )
 
 # 下载并包含GoogleTest源码
@@ -38,6 +41,13 @@ add_subdirectory(
 
 # 添加测试可执行文件
 add_executable(unit_tests ${TEST_SOURCES})
+
+# 测试代码允许用 C++17（如结构化绑定）：仅作用于测试目标，不放宽产品代码的 C++11 约束。
+# 生产库/可执行仍是严格 -std=c++11（见顶层 CMAKE_CXX_STANDARD/EXTENSIONS）。
+set_target_properties(unit_tests PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED YES
+    CXX_EXTENSIONS OFF)
 
 # 包含GoogleTest头文件
 target_include_directories(unit_tests PRIVATE

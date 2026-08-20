@@ -9,6 +9,9 @@ public:
     xdb_search_t(const std::string& file_name);
     ~xdb_search_t();
 
+    // 打开失败时为 false（构造不再 exit 杀进程），调用方据此降级（如归属地留空）。
+    bool is_ok() const { return db != NULL; }
+
     void init_file();
     void init_vector_index();
     void init_content();

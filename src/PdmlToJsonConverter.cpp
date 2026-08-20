@@ -45,8 +45,7 @@ void PdmlToJsonConverter::convertXmlNodeToJson(rapidxml::xml_node<>* xmlNode,
 
 bool PdmlToJsonConverter::convertPcapToXml(const std::string& pcapFile, const std::string& xmlFile)
 {
-    // 用 argv 方式执行 tshark，父进程读取 pdml 输出并写入 XML 文件，
-    // 避免走 shell 和 ">" 重定向，消除文件路径注入风险
+    // 用 argv 执行 tshark，父进程读 pdml 输出写入 XML 文件，避免走 shell 和 ">" 重定向的注入风险
     std::vector<std::string> args = {tsharkPath, "-r", pcapFile, "-T", "pdml"};
     ProcessUtil::ProcHandle tsharkPid = ProcessUtil::kInvalidProc;
     FILE*                    pipe      = ProcessUtil::PopenEx(args, &tsharkPid, "r");

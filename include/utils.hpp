@@ -39,15 +39,15 @@ public:
      */
     static std::string get_timestamp();
 
+    // 清理 dir 下日志：按修改时间保留最近 keep 个（*.log），删除更旧的，防止无限累积。
+    static void pruneLogFiles(const std::string& dir, size_t keep);
+
     static void translateShowNameFields(rapidjson::Value&                   value,
                                         rapidjson::Document::AllocatorType& allocator);
 
     /**
      * @brief 把一批报文序列化为 JSON 字符串（{"total":N,"packets":[...]}）
-     *
-     * 从 SQLiteUtil 的查询序列化中抽出，供多个前端复用：查询结果（CLI/GUI）与
-     * Web 层的 /api/packets 都用同一份字段约定，避免重复实现导致口径漂移。
-     * 只读取 packets（内部用 StringRef 引用其字符串内存），序列化期间入参须存活。
+     * @note 内部用 StringRef 引用 packets 的字符串内存，序列化期间入参须保持存活。
      */
     static std::string packetsToJson(const std::vector<std::shared_ptr<Packet>>& packets);
 };
@@ -75,8 +75,7 @@ public:
      * @param limit 最多返回的行数；<0 表示不分页、返回全部（默认，保持旧行为）
      * @param offset 跳过的行数，仅在 limit>=0 时生效
      *
-     * @note limit>=0 时按 frame_number 升序返回，保证翻页结果稳定；
-     *       大抓包下用分页可避免一次性把全表读进内存造成内存尖峰。
+     * @note limit>=0 时按 frame_number 升序返回，保证翻页稳定；分页避免全表读入的内存尖峰。
      */
     bool queryPacket(std::vector<std::shared_ptr<Packet>>& packetList, int limit = -1,
                      int offset = 0);
@@ -92,12 +91,7 @@ public:
 private:
     sqlite3* db = nullptr;
 
-    /**
-     * @brief 参数化查询中的一个绑定值
-     *
-     * SQL 语句中用 `?` 占位，实际值放在这里，执行时通过 sqlite3_bind_* 绑定，
-     * 从根本上避免把用户输入拼进 SQL 文本造成注入。
-     */
+    // 参数化查询的绑定值：SQL 用 `?` 占位、值经 sqlite3_bind_* 绑定，避免拼接注入。
     struct BindParam
     {
         enum Type

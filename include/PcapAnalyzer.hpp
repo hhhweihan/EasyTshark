@@ -9,9 +9,8 @@
 #include "PcapFileReader.hpp"
 #include "tsharkDataType.hpp"
 
-// 离线解析：读取 pcap 文件，逐行解析 tshark 字段输出为 Packet，并提供
-// 报文列表 / 十六进制原始数据的访问。只负责“解析与就地存取”，不涉及抓包、
-// 数据库入库或格式转换（那些是 LiveCapture / main 的 SQLiteUtil / PdmlToJsonConverter 的职责）。
+// 离线解析：读 pcap 文件，逐行解析 tshark 字段输出为 Packet，提供报文列表 / 原始
+// 十六进制访问。只负责“解析与就地存取”，不涉及抓包、入库或格式转换。
 class PcapAnalyzer
 {
 public:
@@ -46,11 +45,12 @@ public:
     // 只取帧号、不重算 file_offset，故配合已加载报文的既有 offset 可保持 hex 正确。
     // filter 为空视为“全部匹配”返回 false（调用方应据此走不过滤路径）。
     bool getFramesByDisplayFilter(const std::string&     displayFilter,
-                                  std::vector<uint32_t>& frameNumbers);
+                                  std::vector<uint32_t>& frameNumbers,
+                                  std::string* errorOut = nullptr);
 
 private:
-    // 逐包解析核心：跑 tshark 读文件、算 file_offset、补地理位置，每解析出一个
-    // Packet 就回调 onPacket。本身不累积——由调用方决定“累积”还是“流式丢弃”。
+    // 逐包解析核心：跑 tshark、算 file_offset、补地理位置，逐包回调 onPacket。
+    // 本身不累积——由调用方决定“累积”还是“流式丢弃”。
     bool streamPackets(const std::string&                                       filePath,
                        const std::function<void(const std::shared_ptr<Packet>&)>& onPacket);
 
@@ -66,9 +66,8 @@ private:
     // 避免每次取包都重新 open/close 文件（POSIX 走 mmap，非 POSIX 走 ifstream）。
     PcapFileReader fileReader;
 
-    // tshark 的 frame_number 从 1 起、稠密递增，故用 vector 按 (帧号-1) 下标直存：
-    // 相比 unordered_map 省去每包一次哈希桶节点分配与哈希/取模，遍历也变成对连续内存的
-    // 顺序扫描，对 CPU cache 与预取器都更友好。理论上若出现空洞，对应槽为空指针。
+    // frame_number 从 1 起稠密递增，故用 vector 按 (帧号-1) 下标直存（免哈希、cache 友好）；
+    // 若出现空洞，对应槽为空指针。
     std::vector<std::shared_ptr<Packet>> allPackets;
 };
 

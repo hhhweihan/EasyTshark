@@ -1,13 +1,7 @@
 // EventPoller 的 Windows 实现。
-//
-// 为什么不用 poll/WSAPoll：Windows 的 WSAPoll 只支持套接字，而本项目多路复用的是
-// tshark 子进程的匿名管道（CreatePipe），套接字 API 对其无效。故这里用轮询式探测：
-// 对每个已注册 fd，用 _get_osfhandle 取回底层管道 HANDLE，再用 PeekNamedPipe 查看
-// 是否有可读数据或对端是否关闭。语义与 poll 版一致：返回“本次可读/对端关闭/出错”的 fd 列表。
-//
-// 精度取舍：PeekNamedPipe 无法像 poll 那样阻塞等待，故 wait() 采用“小步睡眠 + 轮询”
-// 逼近 timeoutMs。tshark 流量统计是低频秒级数据，这点延迟可接受；且 FlowMonitor 本就
-// 以 500ms 为轮询周期。接口、线程安全语义与 EventPollerPoll.cpp 保持完全一致。
+// 为什么不用 WSAPoll：它只支持套接字，而这里多路复用的是 tshark 子进程的匿名管道。
+// 故改用轮询式探测：对每个 fd 用 PeekNamedPipe 查可读数据/对端关闭，语义与 poll 版一致。
+// 取舍：PeekNamedPipe 不能阻塞，wait() 用“小步睡眠 + 轮询”逼近 timeoutMs（低频数据可接受）。
 
 #include "platform/EventPoller.hpp"
 

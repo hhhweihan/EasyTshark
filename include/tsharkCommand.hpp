@@ -7,21 +7,16 @@
 #include "tsharkDataType.hpp"
 
 // 低层 tshark 交互工具：平台默认路径、命令参数构造、网卡枚举。
-// 各职责类（PcapAnalyzer / LiveCapture / FlowMonitor / PdmlToJsonConverter）
-// 依赖此处的自由函数，此处不反向依赖任何职责类——保持依赖单向。
+// 依赖单向：各职责类依赖此处的自由函数，此处不反向依赖任何职责类。
 namespace TsharkCommand
 {
-// tshark / editcap 的平台默认路径（单一真源）：
-//   Linux 装在 /usr/bin，macOS 由 Wireshark.app 提供，Windows 装在 Program Files。
-// 如与实际安装位置不符，调用方可自行覆盖传入的路径。
+// tshark / editcap 的平台默认路径（单一真源）：Linux /usr/bin、macOS Wireshark.app、
+// Windows Program Files。与实际安装位置不符时调用方可自行覆盖。
 std::string defaultTsharkPath();
 std::string defaultEditcapPath();
 
-// 自动定位 tshark：按 环境变量 EASYTSHARK_TSHARK → 平台默认路径 → PATH →
-// (Windows)注册表 Wireshark InstallDir → 常见安装目录 的顺序，返回首个真实存在的路径；
-// 全都没命中时回退到平台默认路径（让后续报错仍指向一个合理位置）。
-// 目标：装了就能用；装在非默认位置也可用环境变量手动指定，无需重新编译。
-// 平台差异（PATH 分隔符 / .exe 后缀 / 注册表）都封装在实现里，POSIX 行为不受影响。
+// 自动定位 tshark，按序返回首个真实存在的路径，全未命中则回退平台默认路径：
+//   环境变量 EASYTSHARK_TSHARK → 平台默认 → PATH → (Windows)注册表 → 常见安装目录。
 std::string resolveTsharkPath();
 
 // 自动定位 editcap：优先取"解析到的 tshark 同目录"下的 editcap（保证版本/位置一致），

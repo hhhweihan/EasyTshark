@@ -1,7 +1,5 @@
-// PipeIO 的 Windows 实现。
-// Windows 匿名管道不支持 fd 级非阻塞，故用 PeekNamedPipe 先探测可读字节数，
-// 只在确有数据时 ReadFile 相应数量，从而不阻塞。fd 是 _open_osfhandle 封装出的
-// CRT 描述符，用 _get_osfhandle 取回底层管道 HANDLE。
+// PipeIO 的 Windows 实现：匿名管道不支持 fd 级非阻塞，故先 PeekNamedPipe 探测可读量，
+// 有数据才 ReadFile，从而不阻塞。fd 是 CRT 描述符，用 _get_osfhandle 取回管道 HANDLE。
 
 #include "platform/PipeIO.hpp"
 

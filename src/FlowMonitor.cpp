@@ -33,16 +33,15 @@ FlowMonitor::~FlowMonitor()
 
 void FlowMonitor::stopMonitorAdaptersFlowTrend()
 {
-    // 第一步：置位停止标志并 join 监控线程。
-    // 关键：join 时绝不能持 adapterFlowTrendMapLock——监控线程内部要拿同一把锁，
-    // 否则死锁。故先在无锁状态下让线程收敛退出，再去撕毁 map。
+    // 先置停止标志并 join 监控线程。join 时绝不能持 adapterFlowTrendMapLock——
+    // 监控线程内部要拿同一把锁，否则死锁。故先无锁让线程退出，再撕毁 map。
     stopFlag = true;
     if (flowTrendThread.joinable())
     {
         flowTrendThread.join();
     }
 
-    // 第二步：线程已退出，可安全清理监控 map（此时无并发访问）
+    // 线程已退出，可安全清理监控 map（此时无并发访问）
     std::unique_lock<std::recursive_mutex> lock(adapterFlowTrendMapLock);
 
     for (const auto& adapterPipePair : adapterFlowTrendMonitorMap)
@@ -72,16 +71,12 @@ void FlowMonitor::stopMonitorAdaptersFlowTrend()
 void FlowMonitor::getAdaptersFlowTrendData(
     std::map<std::string, std::map<long, long>>& flowTrendData)
 {
-    // 先上锁再读 adapterFlowTrendMonitorStartTime：该值由 startMonitor 在锁内写入，
-    // 放到锁外读会与之竞态。锁同时保护随后对 adapterFlowTrendMonitorMap 的遍历。
+    // 锁保护 adapterFlowTrendMonitorStartTime（startMonitor 在锁内写）与随后对 map 的遍历。
     std::unique_lock<std::recursive_mutex> lock(adapterFlowTrendMapLock);
 
     long timeNow = time(nullptr);
 
-    // 滑动窗口的左右端点：
-    // 一开始：以最开始监控时间为左起点，终点为未来300秒
-    // 随着时间推移，数据逐渐填充完这300秒
-    // 超过300秒之后，结束节点就是当前，开始节点就是当前-300
+    // 滑动窗口左右端点：不足 300 秒时从监控起点算起，超过后取 [当前-300, 当前]。
     long startWindow = timeNow - adapterFlowTrendMonitorStartTime > 300
                            ? timeNow - 300
                            : adapterFlowTrendMonitorStartTime;
@@ -94,10 +89,8 @@ void FlowMonitor::getAdaptersFlowTrendData(
         auto&       targetSeries = flowTrendData[adapterPipePair.first];
         const auto& sourceSeries = adapterPipePair.second.flowTrendData;
 
-        // 稀疏拷贝：只搬运窗口 [startWindow, endWindow] 内“确实有流量”的秒，
-        // 不再对整个窗口逐秒稠密填 0。sourceSeries 是有序 map，用 lower_bound/
-        // upper_bound 定位区间端点即可，避免对上千秒的空洞做无谓插入。
-        // 语义变化：结果中缺失的秒表示该秒无流量（原实现会显式填 0）。
+        // 稀疏拷贝：只搬运窗口内“确实有流量”的秒（有序 map 用 lower/upper_bound 定位区间），
+        // 不逐秒填 0。语义变化：结果中缺失的秒表示该秒无流量。
         auto begin = sourceSeries.lower_bound(startWindow);
         auto end   = sourceSeries.upper_bound(endWindow);
         for (auto it = begin; it != end; ++it)
@@ -153,11 +146,11 @@ void FlowMonitor::startMonitorAdaptersFlowTrend()
         monitorInfo.monitorTsharkPipe = pipe;
         monitorInfo.tsharkPid         = tsharkPid;
 
-        // 建立 fd → 网卡监控状态的 O(1) 反查索引（monitorInfo 是 map 内元素，地址稳定）
+        // fd → 网卡监控状态的 O(1) 反查索引（monitorInfo 是 map 内元素，地址稳定）
         fdToAdapter[pipeFd] = &monitorInfo;
     }
 
-    // 启动监控线程处理轮询事件（joinable，由 stopMonitor / 析构负责 join）
+    // 启动监控线程（joinable，由 stopMonitor / 析构负责 join）
     flowTrendThread = std::thread(&FlowMonitor::adapterFlowTrendMonitorThreadEntry, this);
 }
 
@@ -200,9 +193,8 @@ void accumulateFlowLine(const std::string& line, AdapterMonitorInfo& info)
 
 void FlowMonitor::adapterFlowTrendMonitorThreadEntry()
 {
-    // 每 500ms 轮询一次：既能及时响应新数据，也能在所有网卡管道都关闭后
-    // （size()==0）干净退出线程，避免原先 while(true)+epoll_wait(-1) 的线程泄漏。
-    // stopFlag 用于让 stopMonitor 主动打断轮询、令线程尽快 join。
+    // 每 500ms 轮询一次：及时响应新数据，也能在所有管道关闭(size()==0)后干净退出，避免线程泄漏。
+    // stopFlag 让 stopMonitor 主动打断轮询、令线程尽快 join。
     while (!stopFlag && flowTrendPoller.size() > 0)
     {
         std::vector<int> readyFds = flowTrendPoller.wait(500);
@@ -211,8 +203,7 @@ void FlowMonitor::adapterFlowTrendMonitorThreadEntry()
         {
             int pipeFd = readyFds[idx];
 
-            // 先 O(1) 定位该 fd 对应的网卡监控状态，本轮所有读入都归到它名下。
-            // map 元素地址稳定、且 stopMonitor 会先 join 本线程再动 map，故指针在本轮有效。
+            // O(1) 定位该 fd 的网卡监控状态。map 元素地址稳定、stopMonitor 会先 join 再动 map，故指针本轮有效。
             AdapterMonitorInfo* info = nullptr;
             {
                 std::unique_lock<std::recursive_mutex> lock(adapterFlowTrendMapLock);
@@ -236,8 +227,7 @@ void FlowMonitor::adapterFlowTrendMonitorThreadEntry()
                 std::unique_lock<std::recursive_mutex> lock(adapterFlowTrendMapLock);
                 info->readLeftover.append(buffer, static_cast<size_t>(bytesRead));
 
-                // 一次 read 可能含多行，也可能以半行结尾：切出所有完整行逐一解析，
-                // 未完成的行尾留在 readLeftover 等下次 read 续上（旧实现只解析首行）。
+                // 一次 read 可能含多行或半行：切出所有完整行逐一解析，未完成的行尾留在 readLeftover 续上。
                 size_t nl;
                 while ((nl = info->readLeftover.find('\n')) != std::string::npos)
                 {
@@ -258,15 +248,13 @@ void FlowMonitor::adapterFlowTrendMonitorThreadEntry()
                 if (it != fdToAdapter.end())
                 {
                     AdapterMonitorInfo* dead = it->second;
-                    // 回收子进程避免僵尸，并把句柄置为无效，防止 stopMonitor 再对
-                    // 可能被系统复用的 pid/句柄误发信号。
+                    // 回收子进程避免僵尸，句柄置无效防止 stopMonitor 对复用的 pid 误发信号。
                     if (ProcessUtil::ValidProc(dead->tsharkPid))
                     {
                         ProcessUtil::Kill(dead->tsharkPid);
                         dead->tsharkPid = ProcessUtil::kInvalidProc;
                     }
-                    // fclose 连带关闭底层 fd 并置空——绝不能再 close(pipeFd)，否则与
-                    // fclose 造成对同一 fd 的二次关闭。置空后 stopMonitor 见空即跳过。
+                    // fclose 连带关闭底层 fd 并置空，绝不能再 close(pipeFd) 造成二次关闭。
                     if (dead->monitorTsharkPipe)
                     {
                         fclose(dead->monitorTsharkPipe);

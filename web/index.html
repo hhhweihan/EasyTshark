@@ -7,6 +7,13 @@
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
+    <!-- 访问令牌条：首次访问/令牌失效时显示；令牌存 localStorage 后隐藏 -->
+    <div id="tokenBar" class="tokenbar" style="display:none">
+        <span class="label">访问令牌（见服务器启动输出）</span>
+        <input id="tokenInput" type="password" placeholder="粘贴启动时打印的 Token" size="40">
+        <button id="btnTokenSave">保存</button>
+    </div>
+
     <!-- 工具栏：载入 pcap / 实时抓包 / tshark 路径 -->
     <div class="toolbar">
         <div class="tool-group">
@@ -26,6 +33,11 @@
             <input id="tsharkPath" type="text" placeholder="tshark 可执行文件完整路径" size="34">
             <button id="btnApplyTshark">应用</button>
             <span id="tsharkState" class="hint"></span>
+        </div>
+        <div class="tool-group">
+            <span class="label">导出</span>
+            <input id="csvPath" type="text" placeholder="CSV 保存路径，如 data/export.csv" size="24">
+            <button id="btnExportCsv">导出 CSV</button>
         </div>
     </div>
 
@@ -118,11 +130,16 @@
                 <button class="stat-tab" data-stat="proto">协议统计</button>
                 <button class="stat-tab" data-stat="loc">国家统计</button>
             </div>
-            <div class="table-scroll">
-                <table>
-                    <thead><tr><th id="statNameCol">IP 地址</th><th>包数</th><th>字节</th></tr></thead>
-                    <tbody id="statsBody"></tbody>
-                </table>
+            <div class="stats-layout">
+                <div class="stats-bars">
+                    <canvas id="statsCanvas" height="260"></canvas>
+                </div>
+                <div class="table-scroll">
+                    <table>
+                        <thead><tr><th id="statNameCol">IP 地址</th><th>包数</th><th>字节</th></tr></thead>
+                        <tbody id="statsBody"></tbody>
+                    </table>
+                </div>
             </div>
         </section>
 

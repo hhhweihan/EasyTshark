@@ -14,6 +14,7 @@ LiveCapture::LiveCapture(const std::string& tsharkPath, const std::string& ip2Re
     : tsharkPath_(tsharkPath),
       ip2RegionDbPath_(ip2RegionDbPath),
       stopFlag_(false),
+      running_(false),
       startFailed_(false),
       tsharkPid_(ProcessUtil::kInvalidProc)
 {
@@ -21,11 +22,23 @@ LiveCapture::LiveCapture(const std::string& tsharkPath, const std::string& ip2Re
 
 LiveCapture::~LiveCapture()
 {
-    stopCapture(); // 兜底：避免析构时线程/子进程悬挂
+    // 兜底：避免析构时线程/子进程悬挂。不能只调 stopCapture()——线程可能已自然退出
+    // 但 captureWorkThread_ 仍 joinable，不 join 直接释放会 std::terminate。故独立处理。
+    if (captureWorkThread_)
+    {
+        stopFlag_ = true;
+        ProcessUtil::ProcHandle pid = tsharkPid_.load();
+        if (ProcessUtil::ValidProc(pid))
+            ProcessUtil::Signal(pid);
+        if (captureWorkThread_->joinable())
+            captureWorkThread_->join();
+        captureWorkThread_.reset();
+        running_ = false;
+    }
 }
 
 bool LiveCapture::startCapture(const std::string& adapterName, PacketCallback onPacket,
-                               const std::string& captureFile)
+                               const std::string& captureFile, int durationSeconds)
 {
     if (captureWorkThread_)
     {
@@ -35,14 +48,15 @@ bool LiveCapture::startCapture(const std::string& adapterName, PacketCallback on
     LOG_F(INFO, "即将开始抓包，网卡：%s", adapterName.c_str());
     stopFlag_    = false;
     startFailed_ = false;
+    running_     = true;
     tsharkPid_   = ProcessUtil::kInvalidProc;
     captureWorkThread_ = std::make_shared<std::thread>(&LiveCapture::captureWorkThreadEntry, this,
-                                                       adapterName, captureFile, std::move(onPacket));
+                                                       adapterName, captureFile, std::move(onPacket),
+                                                       durationSeconds);
 
-    // 工作线程要过一会儿才真正 fork 出 tshark，这里等它给出确定结果：
-    //   成功 → tsharkPid_ 落定(>0)；失败 → startFailed_ 置位。
-    // 否则 startCapture 恒返回 true，PopenEx 失败时 isCapturing() 会误报“在抓包”。
-    // 极窄启动窗口内轮询，最多约 1s；超时仍未定则乐观返回（tshark 可能只是启动慢）。
+    // 等工作线程给出确定结果：成功 → tsharkPid_ 落定(>0)；失败 → startFailed_ 置位。
+    // 否则 PopenEx 失败时 startCapture 恒返回 true，isCapturing() 会误报“在抓包”。
+    // 轮询最多约 1s，超时仍未定则乐观返回（tshark 可能只是启动慢）。
     for (int i = 0; i < 200; ++i)
     {
         if (ProcessUtil::ValidProc(tsharkPid_.load()))
@@ -61,14 +75,14 @@ bool LiveCapture::startCapture(const std::string& adapterName, PacketCallback on
 
 bool LiveCapture::stopCapture()
 {
-    if (!captureWorkThread_)
+    if (!running_ || !captureWorkThread_)
         return false; // 未在抓包 / 已停止：幂等，避免二次 join 抛异常
 
     LOG_F(INFO, "即将停止抓包");
     stopFlag_ = true;
 
-    // tshark 往 -w 文件写、几乎不写 stdout，只关管道它不会退出：必须发信号令其收尾，
-    // 读循环随之 EOF 退出。极窄的启动窗口内 pid 可能尚未就位，短暂等待其落定。
+    // tshark 只关管道不会退出，必须发信号令其收尾，读循环随之 EOF 退出。
+    // 启动窗口内 pid 可能尚未就位，短暂等待其落定。
     ProcessUtil::ProcHandle pid = tsharkPid_.load();
     for (int i = 0; !ProcessUtil::ValidProc(pid) && i < 200; ++i)
     {
@@ -77,27 +91,33 @@ bool LiveCapture::stopCapture()
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         pid = tsharkPid_.load();
     }
-    // 只发信号、不回收 —— 交给工作线程里的 PcloseEx 统一回收，避免双重回收。
-    // POSIX 为 SIGTERM（tshark 优雅收尾）；Windows 为 TerminateProcess（无法 flush，见 Signal 注释）。
+    // 只发信号、不回收——交给工作线程里的 PcloseEx 统一回收，避免双重回收。
+    // POSIX 用 SIGTERM 优雅收尾；Windows 用 TerminateProcess（无法 flush，见 Signal 注释）。
     if (ProcessUtil::ValidProc(pid))
         ProcessUtil::Signal(pid);
 
     if (captureWorkThread_->joinable())
         captureWorkThread_->join();
     captureWorkThread_.reset();
+    running_ = false;
     return true;
 }
 
 void LiveCapture::captureWorkThreadEntry(std::string adapterName, std::string captureFile,
-                                         PacketCallback onPacket)
+                                         PacketCallback onPacket, int durationSeconds)
 {
     try
     {
-        // -i 抓指定网卡；-l 行缓冲即时输出；-w + -F pcap 落盘原始报文；
-        // -P 令即便写文件也把包摘要打到 stdout；随后接共享字段列表（-T fields -e ...），
-        // 字段顺序与 PacketParser::parseLine 严格对应，可与离线路径复用同一解析器。
+        // -i 网卡；-l 行缓冲；-w+-F pcap 落盘；-P 写文件时仍把摘要打到 stdout；随后接字段列表，
+        // 字段顺序与 PacketParser::parseLine 严格对应，与离线路径复用同一解析器。
         std::vector<std::string> tsharkArgs = {tsharkPath_, "-i",   adapterName, "-l", "-w",
                                                captureFile, "-F",   "pcap",      "-P"};
+        if (durationSeconds > 0)
+        {
+            // -a duration:N：tshark 抓满 N 秒自行收尾退出（CLI“抓 N 秒”场景；GUI/Web 手动停止不走这里）。
+            tsharkArgs.push_back("-a");
+            tsharkArgs.push_back("duration:" + std::to_string(durationSeconds));
+        }
         std::vector<std::string> fieldArgs = TsharkCommand::tsharkFieldArgs();
         tsharkArgs.insert(tsharkArgs.end(), fieldArgs.begin(), fieldArgs.end());
 
@@ -116,16 +136,14 @@ void LiveCapture::captureWorkThreadEntry(std::string adapterName, std::string ca
         bool ip2RegionReady = IP2RegionUtil::init(ip2RegionDbPath_);
 
         char buffer[8192];
-        // 报文在 capture.pcap 中的偏移：首包紧随 24 字节全局文件头(sizeof(PcapHeader))之后。
-        // 用 64 位累加，避免长时间抓包偏移超过 4GB 溢出。
+        // 报文偏移：首包紧随 24 字节全局文件头之后。用 64 位累加避免长时间抓包超 4GB 溢出。
         uint64_t file_offset = sizeof(PcapHeader);
         while (!stopFlag_ && fgets(buffer, sizeof(buffer), pipe) != nullptr)
         {
             std::shared_ptr<Packet> packet = std::make_shared<Packet>();
             if (!PacketParser::parseLine(buffer, *packet))
             {
-                // 实时路径：单行解析失败就跳过（可能是 tshark 的状态行），不中止整轮。
-                // 偏移可能就此错位，但实时展示以“尽力而为”为主；停止后会离线重解析纠正。
+                // 实时路径单行解析失败就跳过（可能是状态行），偏移或就此错位，停止后离线重解析纠正。
                 continue;
             }
             packet->file_offset = file_offset + sizeof(PacketHeader);
@@ -143,14 +161,17 @@ void LiveCapture::captureWorkThreadEntry(std::string adapterName, std::string ca
 
         ProcessUtil::PcloseEx(pipe, tsharkPid); // fclose + 回收，单点回收
         tsharkPid_ = ProcessUtil::kInvalidProc;
+        running_   = false;
         LOG_F(INFO, "Capture thread exiting gracefully.");
     }
     catch (const std::exception& e)
     {
+        running_ = false;
         LOG_F(ERROR, "Exception in captureWorkThreadEntry: %s", e.what());
     }
     catch (...)
     {
+        running_ = false;
         LOG_F(ERROR, "Unknown exception in captureWorkThreadEntry.");
     }
 }

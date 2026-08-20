@@ -16,6 +16,73 @@
 #include "tsharkCommand.hpp"
 #include "utils.hpp"
 
+namespace
+{
+// ---- pcapng 支持 ----
+// 嗅探格式：pcapng 的 SHB 首 4 字节为 0x0A0D0D0A；经典 pcap 为 a1b2c3d4 等。读前 4 字节区分。
+bool sniffIsPcapNg(const std::string& filePath)
+{
+    FILE* f = std::fopen(filePath.c_str(), "rb");
+    if (!f)
+        return false;
+    unsigned char magic[4] = {0};
+    size_t        n         = std::fread(magic, 1, 4, f);
+    std::fclose(f);
+    if (n < 4)
+        return false;
+    // 小端读 uint32：0x0A0D0D0A
+    return magic[0] == 0x0A && magic[1] == 0x0D && magic[2] == 0x0D && magic[3] == 0x0A;
+}
+
+// 读小端 uint32（pcapng 块内字段；tshark 输出为小端，大端文件罕见，暂不支持）
+uint32_t readLe32(const unsigned char* p)
+{
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// 预扫描 pcapng，返回各包 packet-data 在文件中的偏移（按帧号 0 基索引）。
+// 块布局：Block Type(4) + Total Length(4) + 载荷 + Total Length(4)，长度含首尾。
+std::vector<uint64_t> scanPcapNgPacketOffsets(const std::string& filePath)
+{
+    std::vector<uint64_t> offsets;
+    FILE* f = std::fopen(filePath.c_str(), "rb");
+    if (!f)
+        return offsets;
+
+    unsigned char hdr[8];
+    while (std::fread(hdr, 1, 8, f) == 8)
+    {
+        uint32_t type = readLe32(hdr);
+        uint32_t total = readLe32(hdr + 4);
+        if (total < 12)
+            break; // 损坏：块长不合法
+
+        if (type == 0x00000006) // EPB：接口ID(4)+tsHigh(4)+tsLow(4)+capLen(4)+origLen(4)，数据在块内偏移 28
+        {
+            uint64_t blockStart = 0;
+            // 块起始 = 当前位置 - 8（已读 8 字节头）
+            long long cur = std::ftell(f);
+            uint64_t blockStart64 = static_cast<uint64_t>(cur) - 8;
+            offsets.push_back(blockStart64 + 28);
+        }
+        else if (type == 0x00000003) // SPB：origLen(4) 后即数据，数据在块内偏移 12
+        {
+            long long cur = std::ftell(f);
+            uint64_t blockStart64 = static_cast<uint64_t>(cur) - 8;
+            offsets.push_back(blockStart64 + 12);
+        }
+        // 其他块（IDB/NRB/自定义）跳过
+
+        if (std::fseek(f, static_cast<long>(total) - 8, SEEK_CUR) != 0)
+            break; // 前进到下一块（已读 8 字节头）
+    }
+    std::fclose(f);
+    return offsets;
+}
+
+} // namespace
+
 PcapAnalyzer::PcapAnalyzer(const std::string& tsharkPath, const std::string& ip2RegionDbPath)
     : tsharkPath(tsharkPath), ip2RegionDbPath(ip2RegionDbPath)
 {
@@ -46,24 +113,38 @@ bool PcapAnalyzer::streamPackets(
 
     char buffer[4096];
 
-    // 当前处理的报文在文件中的偏移，第一个报文的偏移就是全局文件头24(也就是sizeof(PcapHeader))字节。
-    // 用 64 位累加，避免超过 4GB 的大 pcap 偏移溢出。
+    // pcapng 预扫描：tshark 输出帧序与文件内 EPB/SPB 顺序一致，按帧号索引到
+    // packet-data 偏移（取 hex 用）。经典 pcap 则按 24 字节头 + 记录头累加。
+    std::vector<uint64_t> ngOffsets;
+    bool                  isPcapNg = sniffIsPcapNg(filePath);
+    if (isPcapNg)
+        ngOffsets = scanPcapNgPacketOffsets(filePath);
+
+    // 当前报文在文件中的偏移，首包偏移即全局文件头 sizeof(PcapHeader) 字节；64 位累加避免大 pcap 溢出。
     uint64_t file_offset = sizeof(PcapHeader);
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
     {
         std::shared_ptr<Packet> packet = std::make_shared<Packet>();
         if (!PacketParser::parseLine(buffer, *packet))
         {
-            // 解析失败会破坏后续报文的文件偏移累加，无法安全继续，直接终止本次分析。
-            // 不用 assert：release 构建下 assert 会被去除，等于漏掉这条错误路径。
+            // 解析失败会破坏后续偏移累加，无法安全继续，直接终止（不用 assert：release 会被去除）。
             LOG_F(ERROR, "解析 tshark 输出行失败，终止分析: %s", buffer);
             ProcessUtil::PcloseEx(pipe, tsharkPid);
             return false;
         }
 
-        // 记录本包偏移，再前移游标到下一包起始（包头 + 抓包长度）
-        packet->file_offset = file_offset + sizeof(PacketHeader);
-        file_offset         = file_offset + sizeof(PacketHeader) + packet->cap_len;
+        if (isPcapNg)
+        {
+            // 按帧号取预扫描偏移；越界时置 0，getPacketHexData 的越界检查会返回 false。
+            size_t idx = static_cast<size_t>(packet->frame_number) - 1;
+            packet->file_offset = (idx < ngOffsets.size()) ? ngOffsets[idx] : 0;
+        }
+        else
+        {
+            // 记录本包偏移，再前移游标到下一包起始（包头 + 抓包长度）
+            packet->file_offset = file_offset + sizeof(PacketHeader);
+            file_offset         = file_offset + sizeof(PacketHeader) + packet->cap_len;
+        }
 
         if (ip2RegionReady)
         {
@@ -90,8 +171,7 @@ bool PcapAnalyzer::analysisFile(const std::string& filePath)
 
     currentFilePath = filePath;
 
-    // 打开随机读取器一次，供后续 getPacketHexData 复用；失败不影响解析结果本身，
-    // 仅令取 hex 数据不可用（getPacketHexData 会因未打开而返回 false）。
+    // 打开随机读取器一次供 getPacketHexData 复用；失败仅令取 hex 不可用，不影响解析结果。
     if (!fileReader.open(filePath))
     {
         LOG_F(WARNING, "无法打开报文文件用于十六进制读取: %s", filePath.c_str());
@@ -133,8 +213,7 @@ bool PcapAnalyzer::analysisFile(const std::string& filePath,
 
 void PcapAnalyzer::processPacket(const std::shared_ptr<Packet>& packet)
 {
-    // tshark 的 frame_number 从 1 起、稠密递增，用 (帧号-1) 作下标直接落入连续内存：
-    // 顺序插入时等价于 push_back，省去 unordered_map 每包一次的哈希桶节点分配与哈希计算。
+    // frame_number 从 1 起、稠密递增，用 (帧号-1) 作下标落入连续内存，省去 map 的哈希开销。
     if (packet->frame_number <= 0)
     {
         return; // 帧号异常（理论上不会出现），无法映射到下标，跳过
@@ -142,8 +221,7 @@ void PcapAnalyzer::processPacket(const std::shared_ptr<Packet>& packet)
     size_t idx = static_cast<size_t>(packet->frame_number) - 1;
     if (idx >= allPackets.size())
     {
-        // 顺序到达时每次仅 +1；vector 的几何增长保证整体仍是摊还 O(1)。
-        // 若偶发乱序/空洞，留空槽也能保证按帧号随机访问不越界。
+        // 顺序到达等价 push_back，摊还 O(1)；偶发乱序留空槽也保证按帧号随机访问不越界。
         allPackets.resize(idx + 1);
     }
     allPackets[idx] = packet;
@@ -251,8 +329,7 @@ std::string attr(rapidxml::xml_node<>* node, const char* name)
     return a ? std::string(a->value(), a->value_size()) : std::string();
 }
 
-// 把一个 PDML 的 <proto>/<field> 节点递归转成 DetailNode：
-// label 优先用 showname（人类可读），回退到 name；value 优先 show，回退 value。
+// 把 PDML 的 <proto>/<field> 节点递归转成 DetailNode：label 用 showname 回退 name，value 用 show 回退 value。
 DetailNode pdmlNodeToDetail(rapidxml::xml_node<>* node)
 {
     DetailNode d;
@@ -332,43 +409,64 @@ bool PcapAnalyzer::getPacketDetailTree(uint32_t frameNumber, DetailNode& root)
 }
 
 bool PcapAnalyzer::getFramesByDisplayFilter(const std::string&     displayFilter,
-                                            std::vector<uint32_t>& frameNumbers)
+                                            std::vector<uint32_t>& frameNumbers,
+                                            std::string* errorOut)
 {
     frameNumbers.clear();
+    if (errorOut)
+        errorOut->clear();
     if (currentFilePath.empty())
     {
         LOG_F(ERROR, "尚未分析任何文件，无法执行显示过滤");
+        if (errorOut)
+            *errorOut = "尚未分析任何文件";
         return false;
     }
     if (displayFilter.empty())
     {
+        if (errorOut)
+            *errorOut = "过滤表达式为空";
         return false; // 空过滤：交由调用方走“不过滤”路径
     }
 
-    // 只取匹配帧号：-Y 过滤 + -T fields -e frame.number，逐行一个编号。
+    // 只取匹配帧号：-Y 过滤 + -T fields -e frame.number；mergeStderr 把 tshark 错误合并进管道以透传。
     std::vector<std::string> args = {tsharkPath,    "-r", currentFilePath,
                                      "-Y",          displayFilter,
                                      "-T",          "fields",
                                      "-e",          "frame.number"};
 
     ProcessUtil::ProcHandle tsharkPid = ProcessUtil::kInvalidProc;
-    FILE* pipe      = ProcessUtil::PopenEx(args, &tsharkPid, "r");
+    FILE* pipe = ProcessUtil::PopenEx(args, &tsharkPid, "r", /*mergeStderr=*/true);
     if (!pipe)
     {
         LOG_F(ERROR, "运行 tshark 执行显示过滤失败: %s", displayFilter.c_str());
+        if (errorOut)
+            *errorOut = "无法启动 tshark 执行过滤";
         return false;
     }
 
-    char buffer[256];
+    char   buffer[256];
+    bool   sawError = false; // stderr 合并后，错误行以 "tshark:" 等前缀出现
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
     {
-        // 每行一个帧号，可能带前后空白；空行跳过，非法行忽略不中断。
+        // 每行一个帧号，可能带前后空白；空行跳过。
+        std::string line(buffer);
+        size_t      begin = line.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos)
+            continue;
+        // 合法帧号是纯数字；非数字开头的行视为 tshark 错误/警告，记首行原文供 UI 展示。
+        if (line[begin] < '0' || line[begin] > '9')
+        {
+            if (errorOut && errorOut->empty())
+            {
+                size_t e = line.find_last_not_of("\r\n");
+                *errorOut = line.substr(begin, e - begin + 1);
+            }
+            sawError = true;
+            continue;
+        }
         try
         {
-            std::string line(buffer);
-            size_t      begin = line.find_first_not_of(" \t\r\n");
-            if (begin == std::string::npos)
-                continue;
             frameNumbers.push_back(static_cast<uint32_t>(std::stoul(line.substr(begin))));
         }
         catch (const std::exception&)
@@ -377,5 +475,14 @@ bool PcapAnalyzer::getFramesByDisplayFilter(const std::string&     displayFilter
         }
     }
     ProcessUtil::PcloseEx(pipe, tsharkPid);
+
+    // 没有任何帧号且捕获到错误行：视为过滤失败（表达式非法等），返回 false 并带错误。
+    if (sawError && frameNumbers.empty())
+    {
+        if (errorOut && errorOut->empty())
+            *errorOut = "过滤表达式无效（tshark 拒绝执行）";
+        LOG_F(WARNING, "显示过滤失败（tshark 报错）: %s", displayFilter.c_str());
+        return false;
+    }
     return true;
 }

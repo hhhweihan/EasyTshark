@@ -17,8 +17,7 @@ namespace TsharkCommand
 
 namespace
 {
-// 判断给定路径是否为可打开的现有文件。tshark/editcap 都是普通可执行文件，
-// 用 fopen("rb") 做存在性探测：跨平台、无额外依赖，能打开即存在且可读。
+// 判断路径是否为可打开的现有文件（fopen 探测：跨平台、无额外依赖）。
 bool fileReadable(const std::string& path)
 {
     if (path.empty())
@@ -66,8 +65,7 @@ std::string searchInPath(const std::string& exeName)
 }
 
 #if defined(_WIN32)
-// 从注册表读 Wireshark 安装目录：安装程序会写 HKLM\SOFTWARE\Wireshark 的 InstallDir，
-// 64 位机上也可能落在 WOW6432Node。读到目录后拼上 tshark.exe，存在才返回。仅 Windows 编译。
+// 从注册表 HKLM\SOFTWARE\Wireshark（含 WOW6432Node）读 InstallDir，拼 tshark.exe。仅 Windows。
 std::string tsharkFromRegistry()
 {
     const char* subKeys[] = {"SOFTWARE\\Wireshark", "SOFTWARE\\WOW6432Node\\Wireshark"};
@@ -222,13 +220,8 @@ bool tsharkAvailable(const std::string& path)
 
 std::string resolveTsharkPath()
 {
-    // 解析顺序（先命中先用）：
-    //   1. 环境变量 EASYTSHARK_TSHARK：用户显式覆盖，最高优先级，无需重编译。
-    //   2. 平台默认路径：多数标准安装命中于此。
-    //   3. PATH：tshark 在环境变量里可直接找到（Linux/macOS 常见）。
-    //   4. Windows 注册表 Wireshark InstallDir（含 WOW6432Node）。
-    //   5. 常见安装目录兜底。
-    // 全都没命中时回退平台默认路径，让后续报错信息仍指向一个合理位置。
+    // 解析顺序（先命中先用）：环境变量 EASYTSHARK_TSHARK（用户覆盖）→ 平台默认路径 →
+    // PATH → Windows 注册表 InstallDir → 常见安装目录。全不命中则回退平台默认路径。
     if (const char* env = std::getenv("EASYTSHARK_TSHARK"))
     {
         if (env[0] != 0 && fileReadable(env))
@@ -260,8 +253,7 @@ std::string resolveTsharkPath()
 
 std::string resolveEditcapPath()
 {
-    // editcap 与 tshark 同目录发行：直接从解析到的 tshark 路径推导，保证两者版本/位置一致。
-    // 推导不出或该文件不存在时回退平台默认 editcap 路径。
+    // editcap 与 tshark 同目录发行：从解析到的 tshark 路径推导；推导不出则回退默认。
     std::string tshark = resolveTsharkPath();
     std::size_t slash  = tshark.find_last_of("/\\");
     if (slash != std::string::npos)
