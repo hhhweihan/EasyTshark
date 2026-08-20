@@ -1,10 +1,5 @@
-// EasyTshark Web 前端路由层：把 HTTP 路由、令牌鉴权、Origin 校验、/api/load 路径白名单集中于此，
-// 生产入口与单元测试复用。所有逻辑经 AnalysisSession 门面，本文件只做 HTTP 请求 ↔ 门面调用的装配。
-//
-// 线程：httplib 每连接一线程，处理器可能并发进入；用 opMutex_ 串行化所有写操作（粗粒度锁，
-// 单用户工具足够）；实时抓包回调在抓包线程执行，只推进带独立锁的 liveBuffer_，与 opMutex_ 互不阻塞。
-// 安全：所有 /api/* 须带 X-Auth-Token；浏览器请求还校验 Origin==Host（防 DNS rebinding）；
-// /api/load 仅允许用户主目录或 data/ 下的文件。静态资源不要求 token。
+// EasyTshark Web 前端路由层：HTTP 路由、鉴权、Origin 校验、/api/load 路径白名单集中于此，
+// 生产入口与单元测试复用；所有逻辑经 AnalysisSession 门面装配（线程/安全细节见各校验函数注释）。
 
 #include <climits>
 #include <cstdlib>
@@ -197,11 +192,13 @@ std::string jsonStr(const rapidjson::Document& doc, const char* key)
 }
 
 // 把协议分层树递归序列化成 rapidjson 值：{label,value,children:[...]}。
+// StringRef 引用 node 已有内存：node 由调用方在同一 handler 作用域内构建，
+// 存活到 doc.Accept(writer) 完成，无需再深拷贝一份。
 rapidjson::Value detailToJson(const DetailNode& node, rapidjson::Document::AllocatorType& alloc)
 {
     rapidjson::Value obj(rapidjson::kObjectType);
-    obj.AddMember("label", rapidjson::Value(node.label.c_str(), alloc), alloc);
-    obj.AddMember("value", rapidjson::Value(node.value.c_str(), alloc), alloc);
+    obj.AddMember("label", rapidjson::StringRef(node.label.c_str(), node.label.size()), alloc);
+    obj.AddMember("value", rapidjson::StringRef(node.value.c_str(), node.value.size()), alloc);
 
     rapidjson::Value children(rapidjson::kArrayType);
     for (const DetailNode& child : node.children)
@@ -245,7 +242,6 @@ void registerRoutes(httplib::Server& svr, std::shared_ptr<WebState> st)
         return httplib::Server::HandlerResponse::Unhandled;
     });
 
-    // 服务运行状态：前端轮询用（实时抓包时据此拉取增量、更新计数）。
     svr.Get("/api/status", [st](const httplib::Request&, httplib::Response& res)
     {
         std::lock_guard<std::mutex> lk(st->opMutex);
@@ -311,19 +307,19 @@ void registerRoutes(httplib::Server& svr, std::shared_ptr<WebState> st)
                 page  = 0;
             }
             size_t end = std::min(total, begin + static_cast<size_t>(pageSize));
-            std::vector<PacketPtr> slice(snap->begin() + begin, snap->begin() + end);
 
-            // 用 rapidjson 组装 {total,page,pageSize,packets:[...]}，packets 复用 packetsToJson 结果。
+            // 直接用迭代器区间写入 doc 自己的 allocator：不拷出中间 vector（每个元素是一次
+            // shared_ptr 原子 incref/decref），也不走"序列化成字符串再 Parse 再 CopyFrom"的
+            // 三次往返，只在最外层序列化一次。
             rapidjson::Document doc;
             doc.SetObject();
             doc.AddMember("total", static_cast<uint64_t>(total), doc.GetAllocator());
             doc.AddMember("page", static_cast<int>(page), doc.GetAllocator());
             doc.AddMember("pageSize", static_cast<int>(pageSize), doc.GetAllocator());
-            rapidjson::Document innerDoc;
-            innerDoc.Parse(CommonUtil::packetsToJson(slice).c_str());
-            rapidjson::Value packetsVal;
-            packetsVal.CopyFrom(innerDoc["packets"], doc.GetAllocator());
-            doc.AddMember("packets", packetsVal, doc.GetAllocator());
+            doc.AddMember("packets",
+                         CommonUtil::packetsToJsonValue(snap->begin() + begin, snap->begin() + end,
+                                                        doc.GetAllocator()),
+                         doc.GetAllocator());
             rapidjson::StringBuffer                    buf;
             rapidjson::Writer<rapidjson::StringBuffer> writer(buf);
             doc.Accept(writer);
@@ -336,7 +332,6 @@ void registerRoutes(httplib::Server& svr, std::shared_ptr<WebState> st)
         sendJson(res, CommonUtil::packetsToJson(*snap));
     });
 
-    // 指定帧号的原始字节（十六进制视图）。
     svr.Get(R"(/api/hex/(\d+))", [st](const httplib::Request& req, httplib::Response& res)
     {
         // 用 strtoul 而非会抛 out_of_range 的 stoul：超长数字串越界返回 ULONG_MAX，自然走 404。
@@ -353,7 +348,6 @@ void registerRoutes(httplib::Server& svr, std::shared_ptr<WebState> st)
                           "\"}");
     });
 
-    // 指定帧号的协议分层树（详情面板）。
     svr.Get(R"(/api/detail/(\d+))", [st](const httplib::Request& req, httplib::Response& res)
     {
         uint32_t                    frame =
@@ -375,7 +369,7 @@ void registerRoutes(httplib::Server& svr, std::shared_ptr<WebState> st)
         sendJson(res, buf.GetString());
     });
 
-    // 载入并解析服务器本地的一个 pcap 文件（注意：路径在服务器端文件系统解析）。
+    // 注意：path 是服务器端文件系统路径（非浏览器本地文件），白名单见 isPathAllowed。
     svr.Post("/api/load", [st](const httplib::Request& req, httplib::Response& res)
     {
         rapidjson::Document doc;
@@ -391,7 +385,6 @@ void registerRoutes(httplib::Server& svr, std::shared_ptr<WebState> st)
             return;
         }
         std::lock_guard<std::mutex> lk(st->opMutex);
-        // 路径白名单：只允许载入用户主目录 / data/ 下的文件，避免任意文件被读取。
         if (!isPathAllowed(path))
         {
             sendError(res, "路径不在允许范围内（仅限用户主目录或 data/ 下的文件）", 403);
@@ -625,7 +618,6 @@ void registerRoutes(httplib::Server& svr, std::shared_ptr<WebState> st)
     });
 
     // 导出当前报文快照为 CSV（服务器端路径），供 Excel / 数据分析工具二次加工。
-    // 路径同样受白名单约束（只写用户主目录或 data/ 下）。
     svr.Post("/api/export/csv", [st](const httplib::Request& req, httplib::Response& res)
     {
         rapidjson::Document doc;
@@ -657,6 +649,43 @@ void registerRoutes(httplib::Server& svr, std::shared_ptr<WebState> st)
         catch (const std::exception& e)
         {
             sendError(res, std::string("导出 CSV 失败：") + e.what());
+            return;
+        }
+        sendJson(res, "{\"ok\":true,\"path\":\"" + path + "\"}");
+    });
+
+    // 把当前载入/抓包的 pcap 另存到服务器端路径（对齐桌面端"保存"按钮）。
+    svr.Post("/api/export/pcap", [st](const httplib::Request& req, httplib::Response& res)
+    {
+        rapidjson::Document doc;
+        if (!parseBody(req, doc))
+        {
+            sendError(res, "请求体不是合法 JSON", 400);
+            return;
+        }
+        std::string path = jsonStr(doc, "path");
+        if (path.empty())
+        {
+            sendError(res, "缺少 path 字段", 400);
+            return;
+        }
+        if (!isPathAllowed(path))
+        {
+            sendError(res, "路径不在允许范围内（仅限用户主目录或 data/ 下的文件）", 403);
+            return;
+        }
+        std::lock_guard<std::mutex> lk(st->opMutex);
+        try
+        {
+            if (!st->session.savePcapAs(path))
+            {
+                sendError(res, "保存 pcap 失败（是否已载入或抓包？）");
+                return;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            sendError(res, std::string("保存 pcap 失败：") + e.what());
             return;
         }
         sendJson(res, "{\"ok\":true,\"path\":\"" + path + "\"}");

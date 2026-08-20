@@ -38,6 +38,8 @@
             <span class="label">导出</span>
             <input id="csvPath" type="text" placeholder="CSV 保存路径，如 data/export.csv" size="24">
             <button id="btnExportCsv">导出 CSV</button>
+            <input id="pcapSavePath" type="text" placeholder="PCAP 保存路径，如 data/export.pcap" size="24">
+            <button id="btnExportPcap">保存 PCAP</button>
         </div>
     </div>
 
@@ -78,7 +80,7 @@
                             <thead>
                                 <tr>
                                     <th>No.</th><th>时间</th><th>源</th><th>源归属地</th><th>源端口</th>
-                                    <th>目的</th><th>目的归属地</th><th>目的端口</th><th>协议</th><th>大小</th><th>信息</th>
+                                    <th>目的</th><th>目的归属地</th><th>目的端口</th><th>协议</th><th>大小</th><th>信息</th><th>进程</th>
                                 </tr>
                             </thead>
                             <tbody id="packetsBody"></tbody>
@@ -111,7 +113,8 @@
                     <option value="0">全部会话</option><option value="1">TCP会话</option>
                     <option value="2">UDP会话</option><option value="3">DNS会话</option>
                     <option value="4">HTTP会话</option><option value="5">SSL/TLS会话</option>
-                    <option value="6">SSH会话</option>
+                    <option value="6">SSH会话</option><option value="7">DoIP会话</option>
+                    <option value="8">UDS会话</option><option value="9">CAN会话</option>
                 </select>
                 <span id="sessionCount"></span>
             </div>

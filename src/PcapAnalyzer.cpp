@@ -141,7 +141,6 @@ bool PcapAnalyzer::streamPackets(
         }
         else
         {
-            // 记录本包偏移，再前移游标到下一包起始（包头 + 抓包长度）
             packet->file_offset = file_offset + sizeof(PacketHeader);
             file_offset         = file_offset + sizeof(PacketHeader) + packet->cap_len;
         }
@@ -309,7 +308,7 @@ bool PcapAnalyzer::getPacketHexData(uint32_t frameNumber, std::vector<unsigned c
 
 namespace
 {
-// 把管道里的全部字节读进字符串（tshark 单包 PDML 输出通常不大，一次读完最省事）。
+// tshark 单包 PDML 输出通常不大，一次读完最省事。
 std::string readPipeToString(FILE* pipe)
 {
     std::string out;
@@ -322,14 +321,14 @@ std::string readPipeToString(FILE* pipe)
     return out;
 }
 
-// 取属性值，取不到返回空串（rapidxml 的 first_attribute 可能为 nullptr）。
+// rapidxml 的 first_attribute 可能为 nullptr，需判空后再取值。
 std::string attr(rapidxml::xml_node<>* node, const char* name)
 {
     rapidxml::xml_attribute<>* a = node->first_attribute(name);
     return a ? std::string(a->value(), a->value_size()) : std::string();
 }
 
-// 把 PDML 的 <proto>/<field> 节点递归转成 DetailNode：label 用 showname 回退 name，value 用 show 回退 value。
+// PDML 字段命名约定：label 用 showname 回退 name，value 用 show 回退 value。
 DetailNode pdmlNodeToDetail(rapidxml::xml_node<>* node)
 {
     DetailNode d;
@@ -449,7 +448,6 @@ bool PcapAnalyzer::getFramesByDisplayFilter(const std::string&     displayFilter
     bool   sawError = false; // stderr 合并后，错误行以 "tshark:" 等前缀出现
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
     {
-        // 每行一个帧号，可能带前后空白；空行跳过。
         std::string line(buffer);
         size_t      begin = line.find_first_not_of(" \t\r\n");
         if (begin == std::string::npos)

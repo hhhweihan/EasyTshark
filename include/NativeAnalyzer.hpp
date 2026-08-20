@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "NativePacketParser.hpp"
 #include "PcapFileReader.hpp"
 #include "tsharkDataType.hpp"
 
@@ -39,6 +40,11 @@ private:
     // 文件链路层类型（供 getPacketDetailTree 正确重解析：Ethernet/NULL/SLL 等）。
     int  linkType_ = 1;
     bool analyzed_ = false;
+
+    // CAN 详情查询的增量重放缓存：canReplayCache_ 已喂入帧 [1, canReplayedUpTo_]，
+    // 顺序浏览时只需再喂入 1 帧而非从头重放全部历史帧。乱序往回跳时整体重置重放。
+    mutable NativePacketParser::IsoTpReassembler canReplayCache_;
+    mutable uint32_t                             canReplayedUpTo_ = 0;
 };
 
 #endif

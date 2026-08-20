@@ -38,7 +38,6 @@ bool PcapFileReader::readAt(uint64_t offset, uint32_t len, std::vector<unsigned 
     {
         return false;
     }
-    // 越界检查：避免读到文件尾之外的未定义内容
     if (offset > size_ || len > size_ - offset)
     {
         LOG_F(ERROR, "报文读取越界（偏移 %llu，长度 %u，文件大小 %llu）",
@@ -130,9 +129,10 @@ bool PcapFileReader::open(const std::string& path)
         return false;
     }
 
-    // readAt 是随机小读，内核默认顺序预读会白调相邻页；MADV_RANDOM 关掉预读，只调命中页。
-    // 提示失败不影响正确性（退回默认预读），忽略返回值。
-    ::posix_madvise(addr, static_cast<size_t>(st.st_size), POSIX_MADV_RANDOM);
+    // 主路径是 analyzeFile 对整份文件的一次顺序 viewAt 扫描（readAt 随机访问只在
+    // hex/详情树按需查询时偶发），MADV_SEQUENTIAL 让内核预读跟上顺序访问，减少缺页次数。
+    // 提示失败不影响正确性（退回默认策略），忽略返回值。
+    ::posix_madvise(addr, static_cast<size_t>(st.st_size), POSIX_MADV_SEQUENTIAL);
 
     fd_     = fd;
     mapped_ = addr;
@@ -146,7 +146,6 @@ bool PcapFileReader::readAt(uint64_t offset, uint32_t len, std::vector<unsigned 
     {
         return false;
     }
-    // 越界检查：offset 与 offset+len 都必须落在映射范围内
     if (offset > size_ || len > size_ - offset)
     {
         LOG_F(ERROR, "报文读取越界（偏移 %llu，长度 %u，文件大小 %llu）",

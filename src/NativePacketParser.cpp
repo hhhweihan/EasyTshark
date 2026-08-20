@@ -19,33 +19,81 @@ uint32_t rd32(const unsigned char* p)
     return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
            (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
 }
+uint32_t rdLe32(const unsigned char* p)
+{
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+// 小写十六进制（1/2 字节 → "10" / "8001"）
+std::string hex2(uint8_t b)
+{
+    static const char* digits = "0123456789abcdef";
+    char buf[3];
+    buf[0] = digits[b >> 4];
+    buf[1] = digits[b & 0x0F];
+    buf[2] = '\0';
+    return std::string(buf);
+}
 
 std::string macToStr(const unsigned char* p)
 {
+    static const char* d = "0123456789abcdef";
     char buf[18];
-    std::snprintf(buf, sizeof(buf), "%02x:%02x:%02x:%02x:%02x:%02x", p[0], p[1], p[2], p[3],
-                  p[4], p[5]);
-    return std::string(buf);
+    int  o = 0;
+    for (int i = 0; i < 6; ++i)
+    {
+        if (i)
+            buf[o++] = ':';
+        buf[o++] = d[p[i] >> 4];
+        buf[o++] = d[p[i] & 0x0F];
+    }
+    return std::string(buf, static_cast<size_t>(o));
 }
 
 std::string ipv4ToStr(const unsigned char* p)
 {
     char buf[16];
-    std::snprintf(buf, sizeof(buf), "%u.%u.%u.%u", p[0], p[1], p[2], p[3]);
-    return std::string(buf);
+    int  o = 0;
+    for (int i = 0; i < 4; ++i)
+    {
+        if (i)
+            buf[o++] = '.';
+        unsigned v = p[i];
+        if (v >= 100)
+        {
+            buf[o++] = static_cast<char>('0' + v / 100);
+            v %= 100;
+            buf[o++] = static_cast<char>('0' + v / 10);
+            buf[o++] = static_cast<char>('0' + v % 10);
+        }
+        else if (v >= 10)
+        {
+            buf[o++] = static_cast<char>('0' + v / 10);
+            buf[o++] = static_cast<char>('0' + v % 10);
+        }
+        else
+            buf[o++] = static_cast<char>('0' + v);
+    }
+    return std::string(buf, static_cast<size_t>(o));
 }
 
 std::string ipv6ToStr(const unsigned char* p)
 {
-    char buf[40];
-    int  pos = 0;
+    static const char* d = "0123456789abcdef";
+    char                buf[40];
+    int                 o = 0;
     for (int i = 0; i < 8; ++i)
     {
-        pos += std::snprintf(buf + pos, sizeof(buf) - pos, "%02x%02x", p[i * 2], p[i * 2 + 1]);
-        if (i < 7)
-            buf[pos++] = ':';
+        if (i)
+            buf[o++] = ':';
+        uint16_t g = rd16(p + i * 2);
+        buf[o++]   = d[(g >> 12) & 0xF];
+        buf[o++]   = d[(g >> 8) & 0xF];
+        buf[o++]   = d[(g >> 4) & 0xF];
+        buf[o++]   = d[g & 0xF];
     }
-    return std::string(buf);
+    return std::string(buf, static_cast<size_t>(o));
 }
 
 // TCP flags → "[SYN, ACK]" 写入定长栈缓冲（无 flag 写空串），省去每包临时 std::string。
@@ -71,7 +119,7 @@ void tcpFlagsToBuf(char* out, size_t n, unsigned char flags)
                                                   f.name));
         first = false;
     }
-    if (first) // 一个 flag 都没有
+    if (first)
     {
         out[0] = '\0';
         return;
@@ -96,12 +144,14 @@ const char* serviceForPort(uint16_t port, bool udp)
         if (port == 137 || port == 138) return "NetBIOS";
         if (port == 5353) return "MDNS";
         if (port == 1900) return "SSDP";
+        if (port == 13400) return "DoIP"; // ISO 13400-2 车辆发现（UDP）
         if (port == 443) return "QUIC";
     }
     else
     {
         if (port == 80 || port == 8080) return "HTTP";
         if (port == 443 || port == 8443) return "TLS";
+        if (port == 13400) return "DoIP"; // ISO 13400-2 诊断 over IP（Tester→ECU）
         if (port == 22) return "SSH";
         if (port == 53) return "TCP-DNS";
         if (port == 21) return "FTP";
@@ -116,34 +166,57 @@ const char* serviceForPort(uint16_t port, bool udp)
 }
 
 // ---- DNS 辅助 ----
-// 解析 DNS 名字（标签序列；遇压缩指针 0xC0 停止并返回消费字节数）
-std::string dnsNameAt(const unsigned char* p, uint32_t avail, uint32_t& consumed)
+// 解析 DNS 名字（标签序列；遇压缩指针 0xC0xx（RFC 1035 §4.1.4）跟随跳转，在整份报文 base 内查找目标标签）。
+// offset：名字在 base 内的起始偏移；consumed：本次调用（含跟随的指针）在「起始位置」处占用的字节数
+// （只统计第一段——即指针本身 2 字节，或未遇指针前的标签序列——不含跳转目标处的字节，供上层推进偏移量用）。
+// 只允许向后跳（ptr < 当前访问过的最小偏移）并限制跳转次数，防止构造恶意报文时形成死循环。
+std::string dnsNameAt(const unsigned char* base, uint32_t totalLen, uint32_t offset,
+                      uint32_t& consumed)
 {
     std::string name;
-    uint32_t    pos = 0;
-    while (pos < avail)
+    uint32_t    pos          = offset;
+    uint32_t    firstConsumed = 0;
+    bool        gotFirst     = false;
+    int         jumps        = 0;
+    for (;;)
     {
-        uint8_t len = p[pos];
+        if (pos >= totalLen)
+            break;
+        uint8_t len = base[pos];
         if (len == 0)
         {
-            ++pos;
+            if (!gotFirst)
+            {
+                firstConsumed = pos + 1 - offset;
+                gotFirst      = true;
+            }
             break;
         }
         if ((len & 0xC0) == 0xC0)
         {
-            pos += 2; // 压缩指针：不跟随
-            break;
+            if (pos + 1 >= totalLen || ++jumps > 32)
+                break;
+            uint32_t ptr = (static_cast<uint32_t>(len & 0x3F) << 8) | base[pos + 1];
+            if (!gotFirst)
+            {
+                firstConsumed = pos + 2 - offset;
+                gotFirst      = true;
+            }
+            if (ptr >= pos)
+                break; // 只允许向后跳（严格小于指针自身位置），防止自引用/循环；配合跳转次数上限兜底
+            pos = ptr;
+            continue;
         }
         ++pos;
-        if (pos + len > avail)
+        if (pos + len > totalLen)
             break;
         if (!name.empty())
             name += '.';
         for (uint32_t i = 0; i < len; ++i)
-            name += static_cast<char>(p[pos + i]);
+            name += static_cast<char>(base[pos + i]);
         pos += len;
     }
-    consumed = pos;
+    consumed = gotFirst ? firstConsumed : (pos - offset);
     return name;
 }
 
@@ -176,7 +249,7 @@ std::string dnsFirstQuestion(const unsigned char* payload, uint32_t len, uint16_
         return std::string();
     uint32_t off = 12;
     uint32_t consumed = 0;
-    std::string name = dnsNameAt(payload + 12, len - 12, consumed);
+    std::string name = dnsNameAt(payload, len, off, consumed);
     off += consumed;
     if (off + 4 <= len)
         qtype = rd16(payload + off);
@@ -195,22 +268,20 @@ std::string dnsAnswerSummary(const unsigned char* payload, uint32_t len)
     if (an == 0)
         return out;
     uint32_t off = 12;
-    // 跳过 questions
     for (uint16_t i = 0; i < qd; ++i)
     {
         if (off >= len)
             return out;
         uint32_t consumed = 0;
-        dnsNameAt(payload + off, len - off, consumed);
+        dnsNameAt(payload, len, off, consumed);
         off += consumed + 4; // qtype + qclass
     }
-    // 解析 answers
     for (uint16_t i = 0; i < an && i < anMax; ++i)
     {
         if (off + 10 > len)
             break;
         uint32_t consumed = 0;
-        dnsNameAt(payload + off, len - off, consumed);
+        dnsNameAt(payload, len, off, consumed);
         off += consumed;
         if (off + 10 > len)
             break;
@@ -231,8 +302,9 @@ std::string dnsAnswerSummary(const unsigned char* payload, uint32_t len)
         }
         else if ((type == 12 || type == 5 || type == 2) && rdlen > 0) // PTR/CNAME/NS
         {
+            // 传入整份报文 base + rdata 的绝对偏移（而非局部切片），使压缩指针能跟随到报文其它位置。
             uint32_t c = 0;
-            std::string n = dnsNameAt(rdata, rdlen, c);
+            std::string n = dnsNameAt(payload, len, off + 10, c);
             std::snprintf(buf, sizeof(buf), "%s %s", dnsTypeName(type), n.c_str());
         }
         else if (type == 16 && rdlen > 0) // TXT
@@ -255,7 +327,6 @@ std::string dnsAnswerSummary(const unsigned char* payload, uint32_t len)
     return out;
 }
 
-// DNS 报文 → info 摘要（查询 + 响应回答）
 std::string dnsInfo(const unsigned char* payload, uint32_t len, ProtocolDetail& detail)
 {
     if (len < 12)
@@ -328,7 +399,6 @@ void parseHttp(const unsigned char* payload, uint32_t len, Packet& packet, Proto
         detail.httpMethod  = tok1;
         detail.httpUri     = tok2;
         detail.httpVersion = tok3;
-        // 找 Host 头（前几行内）
         const unsigned char* p = payload;
         const unsigned char* end = payload + len;
         for (int i = 0; i < 20 && p < end; ++i)
@@ -377,12 +447,13 @@ void parseTls(const unsigned char* payload, uint32_t len, Packet& packet, Protoc
     if (version)
         detail.tlsVersion = version;
 
+    const char* recordType = "Unknown"; // 保证 detail.tls 为真时 tlsType 全程非空
     if (rtype == 0x16) // Handshake
     {
         if (len < 6)
             return;
         unsigned char hsType = payload[5];
-        const char*   hsName = nullptr;
+        const char*   hsName = "Handshake";
         switch (hsType)
         {
         case 1: hsName = "Client Hello"; break;
@@ -394,10 +465,9 @@ void parseTls(const unsigned char* payload, uint32_t len, Packet& packet, Protoc
         case 15: hsName = "Certificate Verify"; break;
         case 16: hsName = "Client Key Exchange"; break;
         case 20: hsName = "Finished"; break;
-        default: hsName = "Handshake"; break;
+        default: break;
         }
-        detail.tlsType = hsName;
-        // ClientHello（type 1）里提取 SNI
+        recordType = hsName;
             if (hsType == 1 && len >= 12)
             {
                 // body: version(2) random(32) sidLen(1)+sid cipherLen(2)+ciphers compLen(1)+comp extLen(2)+ext
@@ -453,23 +523,23 @@ void parseTls(const unsigned char* payload, uint32_t len, Packet& packet, Protoc
         }
     else if (rtype == 0x17)
     {
-        detail.tlsType = "Application Data";
+        recordType = "Application Data";
     }
     else if (rtype == 0x15)
     {
-        detail.tlsType = "Alert";
+        recordType = "Alert";
     }
     else if (rtype == 0x14)
     {
-        detail.tlsType = "Change Cipher Spec";
+        recordType = "Change Cipher Spec";
     }
+    detail.tlsType = recordType;
     char buf[128];
     if (!detail.tlsSni.empty())
-        std::snprintf(buf, sizeof(buf), "%s, %s, SNI=%s", detail.tlsType.c_str(),
-                      version ? version : "TLS", detail.tlsSni.c_str());
+        std::snprintf(buf, sizeof(buf), "%s, %s, SNI=%s", recordType, version ? version : "TLS",
+                      detail.tlsSni.c_str());
     else
-        std::snprintf(buf, sizeof(buf), "%s, %s", detail.tlsType.c_str(),
-                      version ? version : "TLS");
+        std::snprintf(buf, sizeof(buf), "%s, %s", recordType, version ? version : "TLS");
     packet.info = buf;
 }
 
@@ -548,6 +618,382 @@ void parseNtp(const unsigned char* payload, uint32_t len, Packet& packet, Protoc
     packet.info    = buf;
 }
 
+// ---- SSH（RFC 4253 §4.2）----
+// 版本交换阶段以明文单行 banner 开始："SSH-protoversion-softwareversion[ comments]\r\n"（上限 255 字节）。
+// 交换完成后转入二进制协议且通常加密，本引擎不解密，只识别这条 banner 行。
+void parseSsh(const unsigned char* payload, uint32_t len, Packet& packet, ProtocolDetail& detail)
+{
+    detail.ssh = true;
+    if (len >= 4 && std::memcmp(payload, "SSH-", 4) == 0)
+    {
+        uint32_t scanLen = len > 255 ? 255 : len;
+        const unsigned char* nl = static_cast<const unsigned char*>(
+            std::memchr(payload, '\n', scanLen));
+        uint32_t lineLen = nl ? static_cast<uint32_t>(nl - payload) : scanLen;
+        if (lineLen > 0 && payload[lineLen - 1] == '\r')
+            --lineLen;
+        detail.sshVersion.assign(reinterpret_cast<const char*>(payload), lineLen);
+        packet.info = "Protocol: " + detail.sshVersion;
+        return;
+    }
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "Encrypted Packet (len=%u)", len);
+    packet.info = buf;
+}
+
+// ---- DoIP（ISO 13400-2）/ UDS（ISO 14229-1）/ CAN ----
+const char* doipPayloadTypeName(uint16_t t)
+{
+    switch (t)
+    {
+    case 0x0000: return "Generic DoIP header negative acknowledge";
+    case 0x0001: return "Vehicle identification request";
+    case 0x0002: return "Vehicle identification request with EID";
+    case 0x0003: return "Vehicle identification request with VIN";
+    case 0x0004: return "Vehicle identification response";
+    case 0x0005: return "Routing activation request";
+    case 0x0006: return "Routing activation response";
+    case 0x0007: return "Alive check request";
+    case 0x0008: return "Alive check response";
+    case 0x4001: return "DoIP entity status request";
+    case 0x4002: return "DoIP entity status response";
+    case 0x4003: return "Diagnostic power mode information request";
+    case 0x4004: return "Diagnostic power mode information response";
+    case 0x8001: return "Diagnostic message";
+    case 0x8002: return "Diagnostic message positive acknowledgement";
+    case 0x8003: return "Diagnostic message negative acknowledgement";
+    case 0x8004: return "Diagnostic message (ISO 13400-2:2016)";
+    default: return "Unknown";
+    }
+}
+
+const char* udsServiceName(uint8_t sid)
+{
+    switch (sid)
+    {
+    case 0x10: return "DiagnosticSessionControl";
+    case 0x11: return "ECUReset";
+    case 0x14: return "ClearDiagnosticInformation";
+    case 0x19: return "ReadDTCInformation";
+    case 0x22: return "ReadDataByIdentifier";
+    case 0x23: return "ReadMemoryByAddress";
+    case 0x24: return "ReadScalingDataByIdentifier";
+    case 0x27: return "SecurityAccess";
+    case 0x28: return "CommunicationControl";
+    case 0x29: return "Authentication";
+    case 0x2A: return "ReadDataByPeriodicIdentifier";
+    case 0x2C: return "DynamicallyDefineDataIdentifier";
+    case 0x2E: return "WriteDataByIdentifier";
+    case 0x2F: return "InputOutputControlByIdentifier";
+    case 0x31: return "RoutineControl";
+    case 0x34: return "RequestDownload";
+    case 0x35: return "RequestUpload";
+    case 0x36: return "TransferData";
+    case 0x37: return "RequestTransferExit";
+    case 0x38: return "RequestFileTransfer";
+    case 0x3D: return "WriteMemoryByAddress";
+    case 0x3E: return "TesterPresent";
+    case 0x83: return "AccessTimingParameter";
+    case 0x84: return "SecuredDataTransmission";
+    case 0x85: return "ControlDTCSetting";
+    case 0x86: return "ResponseOnEvent";
+    case 0x87: return "LinkControl";
+    default: return "Unknown";
+    }
+}
+
+const char* udsNrcName(uint8_t nrc)
+{
+    switch (nrc)
+    {
+    case 0x00: return "No error";
+    case 0x10: return "General reject";
+    case 0x11: return "Service not supported";
+    case 0x12: return "Sub-function not supported";
+    case 0x13: return "Incorrect message length or invalid format";
+    case 0x14: return "Response too long";
+    case 0x21: return "Busy repeat request";
+    case 0x22: return "Conditions not correct";
+    case 0x24: return "Request sequence error";
+    case 0x25: return "No response from subnet component";
+    case 0x26: return "Failure prevents execution of requested action";
+    case 0x31: return "Request out of range";
+    case 0x33: return "Security access denied";
+    case 0x34: return "Authentication failed";
+    case 0x35: return "Invalid key";
+    case 0x36: return "Exceeded number of attempts";
+    case 0x37: return "Required time delay not expired";
+    case 0x70: return "Upload/download not accepted";
+    case 0x71: return "Transfer data suspended";
+    case 0x72: return "General programming failure";
+    case 0x73: return "Wrong block sequence counter";
+    case 0x78: return "Request correctly received - response pending";
+    case 0x7E: return "Sub-function not supported in active session";
+    case 0x7F: return "Service not supported in active session";
+    case 0x81: return "Voltage too high";
+    case 0x82: return "Voltage too low";
+    default: return "Unknown";
+    }
+}
+
+// UDS（ISO 14229-1）负载：首字节 SID。请求 SID 0x10~0x87；正响应 = SID+0x40；
+// 负响应 SID=0x7F（后随原 SID 与 NRC）。
+void parseUds(const unsigned char* p, uint32_t len, ProtocolDetail& detail)
+{
+    if (!p || len < 1)
+        return;
+    uint8_t sid = p[0];
+    detail.uds  = true;
+    char    buf[96];
+    if (sid == 0x7F)
+    {
+        detail.udsResponse = true;
+        if (len >= 2)
+        {
+            std::snprintf(buf, sizeof(buf), "Negative response: %s (0x%02x)", udsServiceName(p[1]),
+                          p[1]);
+            detail.udsService = buf;
+        }
+        else
+            detail.udsService = "Negative response";
+        if (len >= 3)
+        {
+            std::snprintf(buf, sizeof(buf), "%s (0x%02x)", udsNrcName(p[2]), p[2]);
+            detail.udsNrc = buf;
+        }
+        return;
+    }
+    if ((sid & 0x40) != 0)
+    {
+        detail.udsResponse = true;
+        uint8_t reqSid      = static_cast<uint8_t>(sid & 0xBF);
+        std::snprintf(buf, sizeof(buf), "Positive response: %s (0x%02x)", udsServiceName(reqSid),
+                      reqSid);
+        detail.udsService = buf;
+        return;
+    }
+    std::snprintf(buf, sizeof(buf), "%s (0x%02x)", udsServiceName(sid), sid);
+    detail.udsService = buf;
+}
+
+// 已知 UDS 服务 SID（请求/正响应/负响应），用于判定 CAN 数据区是否为 UDS 负载（降低误报）。
+bool isKnownUdsSid(uint8_t b)
+{
+    if (b == 0x7F)
+        return true;
+    if ((b & 0x40) != 0)
+        b = static_cast<uint8_t>(b & 0xBF); // 正响应：回退到请求 SID
+    switch (b)
+    {
+    case 0x10: case 0x11: case 0x14: case 0x19: case 0x22: case 0x23: case 0x24:
+    case 0x27: case 0x28: case 0x29: case 0x2A: case 0x2C: case 0x2E: case 0x2F:
+    case 0x31: case 0x34: case 0x35: case 0x36: case 0x37: case 0x38: case 0x3D:
+    case 0x3E: case 0x83: case 0x84: case 0x85: case 0x86: case 0x87:
+        return true;
+    default: return false;
+    }
+}
+
+// DoIP（ISO 13400-2）帧头：ver(1) invVer(1) payloadType(2) payloadLen(4)，网络字节序。
+// 诊断消息（0x8001/0x8004）负载 = 源地址(2) + 目标地址(2) + UDS。
+void parseDoip(const unsigned char* payload, uint32_t len, Packet& packet, ProtocolDetail& detail)
+{
+    if (!payload || len < 8)
+        return;
+    uint8_t  ver    = payload[0];
+    uint8_t  invVer = payload[1];
+    uint16_t type   = rd16(payload + 2);
+    uint32_t plen   = rd32(payload + 4);
+    if (ver + invVer != 0xFF) // 版本 + 反码校验（0x02+0xFD / 0x03+0xFC）
+        return;
+    detail.doip      = true;
+    detail.doipType  = type;
+    detail.doipVersion = (ver == 0x02) ? "ISO 13400-2:2012"
+                         : (ver == 0x03) ? "ISO 13400-2:2016"
+                                         : "v" + std::to_string(ver);
+    if (plen > len - 8)
+        plen = len - 8;
+    const unsigned char* body = payload + 8;
+
+    if (type == 0x8001 || type == 0x8004) // 诊断消息（源/目标地址 + UDS）
+    {
+        uint32_t udsOff = (plen >= 4) ? 4 : 0;
+        if (plen > udsOff)
+            parseUds(body + udsOff, plen - udsOff, detail);
+    }
+    else if (type == 0x8002 && plen >= 1) // 诊断消息 ACK：ackCode(1) + ...
+    {
+        detail.doipDesc = (body[0] == 0x00) ? "Diagnostic message ACK (positive)"
+                                            : "Diagnostic message ACK (negative)";
+    }
+
+    char buf[200];
+    const char* name = doipPayloadTypeName(type);
+    if (detail.uds)
+    {
+        if (detail.udsNrc.empty())
+            std::snprintf(buf, sizeof(buf), "%s, %s", name, detail.udsService.c_str());
+        else
+            std::snprintf(buf, sizeof(buf), "%s, %s, NRC %s", name, detail.udsService.c_str(),
+                          detail.udsNrc.c_str());
+    }
+    else
+        std::snprintf(buf, sizeof(buf), "%s (type=0x%04x, len=%u)", name, type, plen);
+    packet.info     = buf;
+    packet.protocol = detail.uds ? "UDS" : "DoIP";
+    packet.is_doip  = true;
+}
+
+std::string canDataHex(const unsigned char* d, uint32_t n)
+{
+    std::string s;
+    uint32_t show = n > 8 ? 8 : n;
+    for (uint32_t i = 0; i < show; ++i)
+    {
+        if (i)
+            s += ' ';
+        s += hex2(d[i]);
+    }
+    if (n > show)
+        s += " ...";
+    return s;
+}
+
+// 提取 CAN/CAN FD 帧的 ID 与数据区（不含 ISO-TP/UDS 语义），parseCan 与 feedCanFrame 共用。链路布局：
+//   DLT 227（SocketCAN）：8 字节头 can_id(4, LE) + flags/len(4) + data（偏移 8 起）。
+//   DLT 228（原始 CAN）：4 字节 can_id(LE，高 3 位 EFF/RTR/ERR) + 数据（经典 ≤8）。
+//   DLT 229（原始 CAN FD）：同 228，数据可达 64 字节。
+// can_id 高 3 位标志：0x80000000=EFF（扩展帧） 0x40000000=RTR 0x20000000=ERR。
+bool extractCanPayload(const unsigned char* data, uint32_t len, int linkType, uint32_t& canId,
+                       bool& extended, const unsigned char*& dptr, uint32_t& dlen)
+{
+    if (!data || len < 4)
+        return false;
+    if (linkType == 227)
+    {
+        if (len < 8)
+            return false;
+        uint32_t raw = rdLe32(data);
+        canId        = raw & 0x1FFFFFFF;
+        extended     = (raw & 0x80000000) != 0;
+        dptr = data + 8;
+        dlen = len - 8;
+    }
+    else // DLT 228 / 229
+    {
+        uint32_t raw = rdLe32(data);
+        canId        = raw & 0x1FFFFFFF;
+        extended     = (raw & 0x80000000) != 0;
+        uint32_t maxD = (linkType == 229) ? 64 : 8;
+        dptr = data + 4;
+        dlen = len - 4;
+        if (dlen > maxD)
+            dlen = maxD;
+    }
+    return true;
+}
+
+// CAN 帧解析（含 ISO-TP 单帧/多帧解包后识别 UDS 负载）。
+// isoTp：非空时用于 FF/CF/FC 跨帧重组；为空时仍能识别帧类型，但不会累积/完成多帧重组。
+void parseCan(const unsigned char* data, uint32_t len, int linkType, Packet& packet,
+              ProtocolDetail& detail, IsoTpReassembler* isoTp)
+{
+    uint32_t canId = 0;
+    bool     extended = false;
+    const unsigned char* dptr = nullptr;
+    uint32_t              dlen = 0;
+    if (!extractCanPayload(data, len, linkType, canId, extended, dptr, dlen))
+        return;
+    detail.can          = true;
+    detail.canId        = canId;
+    detail.canExtended  = extended;
+    packet.can_id       = canId;
+
+    uint32_t    dlc  = dlen;
+    const char* kind = "CAN";
+    if (linkType == 227)
+    {
+        unsigned char flags = data[4];
+        bool          isFd  = (flags & 0x80) != 0; // CANFD_FDF
+        dlc = isFd ? data[5] : (flags & 0x0F);
+        if (dlc > dlen)
+            dlc = dlen;
+        if (isFd)
+        {
+            bool brs = (flags & 0x01) != 0, esi = (flags & 0x02) != 0;
+            kind = (brs && esi) ? "CAN FD BRS ESI" : brs ? "CAN FD BRS" : esi ? "CAN FD ESI"
+                                                                              : "CAN FD";
+        }
+    }
+    else if (linkType == 229)
+        kind = "CAN FD";
+    detail.canKind = kind;
+
+    // ISO-TP（ISO 15765-2）与直接 UDS 的判定天然存在歧义：ISO-TP 的 PCI 字节（FF=0x1x/CF=0x2x/
+    // FC=0x3x）与 UDS SID 空间（几乎覆盖 0x10~0x3E）完全重叠，单看首字节无法可靠区分。这里沿用
+    // 既有的「长度前缀」启发式——先按 SF 语义尝试解出一个已知 SID；命中则认定是不走 ISO-TP 封装、
+    // 直接携带 UDS 的帧（覆盖原 ParsesRawCan/ParsesUdsOverCanSingleFrame 两类用例，逻辑不变）。
+    // 只有这个启发式没命中时，才按 PCI 高 4 位识别 FF/CF/FC 做跨帧重组——保证像 FF 的 0x10 这种
+    // 「PCI 字节恰好等于某个 SID」的合法 ISO-TP 帧不会被误判为直接 UDS。
+    uint8_t pci = (dlen >= 1) ? static_cast<uint8_t>(dptr[0] & 0xF0) : 0xFFu;
+    uint32_t udsOff = 0, udsLen = dlen;
+    if (dlen >= 2 && (dptr[0] & 0x0F) <= dlen - 1)
+    {
+        udsOff = 1;
+        udsLen = dptr[0] & 0x0F;
+    }
+    if (udsLen >= 1 && isKnownUdsSid(dptr[udsOff]))
+    {
+        parseUds(dptr + udsOff, udsLen, detail);
+    }
+    else if (pci == 0x10 || pci == 0x20 || pci == 0x30) // FF/CF/FC：跨帧重组
+    {
+        detail.isoTpFrame = true;
+        IsoTpReassembler local; // 无重组器时的兜底：仅无状态识别帧类型，不会误报 completed
+        IsoTpReassembler::Result r = isoTp ? isoTp->feed(canId, dptr, dlen)
+                                            : local.feed(canId, dptr, dlen);
+        detail.isoTpKind = (pci == 0x10) ? "First Frame"
+                          : (pci == 0x20) ? "Consecutive Frame"
+                                          : "Flow Control";
+        detail.isoTpSeq      = (pci == 0x20) ? static_cast<uint16_t>(dptr[0] & 0x0F) : 0;
+        detail.isoTpTotalLen = r.totalLen;
+        if (r.completed && !r.payload.empty() && isKnownUdsSid(r.payload[0]))
+            parseUds(r.payload.data(), static_cast<uint32_t>(r.payload.size()), detail);
+    }
+
+    char buf[160];
+    if (detail.uds)
+    {
+        std::snprintf(buf, sizeof(buf), "%s 0x%03x, %s", detail.canKind, detail.canId,
+                      detail.udsService.c_str());
+        packet.protocol = "UDS";
+    }
+    else if (detail.isoTpFrame)
+    {
+        if (pci == 0x10)
+            std::snprintf(buf, sizeof(buf), "%s 0x%03x ISO-TP First Frame, Len=%u",
+                          detail.canKind, detail.canId, detail.isoTpTotalLen);
+        else if (pci == 0x20)
+            std::snprintf(buf, sizeof(buf), "%s 0x%03x ISO-TP Consecutive Frame, Seq=%u",
+                          detail.canKind, detail.canId, detail.isoTpSeq);
+        else
+            std::snprintf(buf, sizeof(buf), "%s 0x%03x ISO-TP Flow Control", detail.canKind,
+                          detail.canId);
+        packet.protocol = detail.canKind;
+    }
+    else
+    {
+        if (detail.canExtended)
+            std::snprintf(buf, sizeof(buf), "%s 0x%08x DLC=%u %s", detail.canKind, detail.canId,
+                          dlc, canDataHex(dptr, dlen).c_str());
+        else
+            std::snprintf(buf, sizeof(buf), "%s 0x%03x DLC=%u %s", detail.canKind, detail.canId,
+                          dlc, canDataHex(dptr, dlen).c_str());
+        packet.protocol = detail.canKind;
+    }
+    packet.info = buf;
+}
+
 // ---- TCP/UDP ----
 void parseTcp(const unsigned char* data, uint32_t len, Packet& packet, ProtocolDetail& detail)
 {
@@ -570,14 +1016,17 @@ void parseTcp(const unsigned char* data, uint32_t len, Packet& packet, ProtocolD
     uint32_t      tcpLen = (len >= 12) ? ((data[12] >> 4) * 4) : 20;
     uint32_t      appLen = (len > tcpLen) ? (len - tcpLen) : 0;
 
-    // 应用层解析（载荷非空且是已识别服务）
     const unsigned char* app = data + tcpLen;
     if (appLen > 0 && packet.protocol == "HTTP")
         parseHttp(app, appLen, packet, detail);
     else if (appLen > 0 && packet.protocol == "TLS")
         parseTls(app, appLen, packet, detail);
+    else if (appLen > 0 && packet.protocol == "DoIP")
+        parseDoip(app, appLen, packet, detail);
+    else if (appLen > 0 && packet.protocol == "SSH")
+        parseSsh(app, appLen, packet, detail);
 
-    if (detail.http || detail.tls)
+    if (detail.http || detail.tls || detail.doip || detail.ssh)
         return; // 应用层已填 info
 
     char flagsBuf[40];
@@ -627,6 +1076,11 @@ void parseUdp(const unsigned char* data, uint32_t len, Packet& packet, ProtocolD
     if (packet.protocol == "NTP" && appLen > 0)
     {
         parseNtp(app, appLen, packet, detail);
+        return;
+    }
+    if (packet.protocol == "DoIP" && appLen > 0)
+    {
+        parseDoip(app, appLen, packet, detail);
         return;
     }
     char buf[48];
@@ -711,7 +1165,6 @@ void parseArp(const unsigned char* data, uint32_t len, Packet& packet)
     }
 }
 
-// 解析 IPv4（含分片信息）
 bool parseIpv4(const unsigned char* data, uint32_t len, Packet& packet, uint8_t& proto,
                const unsigned char*& payload, uint32_t& payloadLen, ProtocolDetail& detail)
 {
@@ -736,7 +1189,7 @@ bool parseIpv4(const unsigned char* data, uint32_t len, Packet& packet, uint8_t&
 }
 
 bool parseIpv6(const unsigned char* data, uint32_t len, Packet& packet, uint8_t& proto,
-               const unsigned char*& payload, uint32_t& payloadLen)
+               const unsigned char*& payload, uint32_t& payloadLen, ProtocolDetail& detail)
 {
     if (len < 40)
         return false;
@@ -754,10 +1207,14 @@ bool parseIpv6(const unsigned char* data, uint32_t len, Packet& packet, uint8_t&
             break;
         uint8_t next  = data[off];
         uint8_t hlen8 = data[off + 1];
-        if (proto == 44)
+        if (proto == 44) // Fragment Header：next(1) reserved(1) fragOffset+flags(2) id(4)
         {
             if (off + 8 > len)
                 break;
+            uint16_t fragField = rd16(data + off + 2);
+            detail.fragMore     = (fragField & 0x0001) != 0;
+            detail.fragOffset   = static_cast<uint16_t>((fragField & 0xFFF8));
+            detail.ipFragmented = detail.fragOffset != 0 || detail.fragMore;
             off += 8;
         }
         else if (proto == 51)
@@ -785,7 +1242,6 @@ bool parseIpv6(const unsigned char* data, uint32_t len, Packet& packet, uint8_t&
     return true;
 }
 
-// 以太网帧解析
 bool parseEthernet(const unsigned char* data, uint32_t len, Packet& packet,
                    const unsigned char*& payload, uint32_t& payloadLen, uint16_t& ethertype)
 {
@@ -847,7 +1303,7 @@ bool dispatchByEtherType(uint16_t ethertype, const unsigned char* payload, uint3
     if (ethertype == 0x86DD)
     {
         uint8_t proto = 0;
-        if (!parseIpv6(payload, payloadLen, packet, proto, payload, payloadLen))
+        if (!parseIpv6(payload, payloadLen, packet, proto, payload, payloadLen, detail))
             return false;
         if (proto == 6)
             parseTcp(payload, payloadLen, packet, detail);
@@ -892,11 +1348,20 @@ bool parseSll(const unsigned char* data, uint32_t len, bool v2, Packet& packet,
     return dispatchByEtherType(ethertype, data + hdr, len - hdr, packet, detail);
 }
 
-// 主解析：填充 Packet + ProtocolDetail
 bool parseFrameCtx(const unsigned char* data, uint32_t len, int linkType, Packet& packet,
-                   ProtocolDetail& detail)
+                   ProtocolDetail& detail, IsoTpReassembler* isoTp)
 {
-    if (!data || len < 14)
+    if (!data || len < 4)
+        return false;
+
+    // CAN 链路（SocketCAN 227 / 原始 CAN 228 / CAN FD 229）：帧长可小于以太网最小 14 字节，提前分派
+    if (linkType == 227 || linkType == 228 || linkType == 229)
+    {
+        parseCan(data, len, linkType, packet, detail, isoTp);
+        return true;
+    }
+
+    if (len < 14)
         return false;
 
     // NULL/Loopback 链路（BSD lo 接口）
@@ -934,7 +1399,7 @@ bool parseFrameCtx(const unsigned char* data, uint32_t len, int linkType, Packet
         if (family == 30 || family == 24)
         {
             uint8_t proto = 0;
-            if (!parseIpv6(payload, payloadLen, packet, proto, payload, payloadLen))
+            if (!parseIpv6(payload, payloadLen, packet, proto, payload, payloadLen, detail))
                 return false;
             if (proto == 6)
                 parseTcp(payload, payloadLen, packet, detail);
@@ -973,10 +1438,73 @@ bool available()
     return true;
 }
 
-bool parseFrame(const unsigned char* data, uint32_t len, Packet& packet, int linkType)
+IsoTpReassembler::Result IsoTpReassembler::feed(uint32_t canId, const unsigned char* data,
+                                                uint32_t len)
+{
+    Result r;
+    if (!data || len < 1)
+        return r;
+    uint8_t pci = static_cast<uint8_t>(data[0] & 0xF0);
+    if (pci == 0x10) // First Frame：低 4 位 + 下一字节 = 12 位总长度
+    {
+        if (len < 2)
+            return r;
+        r.kind     = kFirstFrame;
+        r.totalLen = static_cast<uint16_t>(((data[0] & 0x0F) << 8) | data[1]);
+        Session& s = sessions_[canId]; // 新首帧覆盖同 ID 上未完成的旧会话
+        s          = Session();
+        s.expectedLen = r.totalLen;
+        uint32_t avail = len - 2;
+        uint32_t take  = avail < s.expectedLen ? avail : s.expectedLen;
+        s.buf.assign(data + 2, data + 2 + take);
+        s.nextSeq = 1;
+    }
+    else if (pci == 0x20) // Consecutive Frame
+    {
+        r.kind = kConsecutive;
+        r.seq  = data[0] & 0x0F;
+        auto it = sessions_.find(canId);
+        if (it == sessions_.end())
+            return r; // 没有对应的首帧：孤立 CF，忽略（不崩溃）
+        Session& s = it->second;
+        uint32_t remain = s.expectedLen > s.buf.size()
+                              ? s.expectedLen - static_cast<uint32_t>(s.buf.size())
+                              : 0;
+        uint32_t avail = len - 1;
+        uint32_t take  = avail < remain ? avail : remain;
+        s.buf.insert(s.buf.end(), data + 1, data + 1 + take);
+        s.nextSeq = static_cast<uint8_t>((s.nextSeq + 1) & 0x0F);
+        if (s.buf.size() >= s.expectedLen)
+        {
+            r.completed = true;
+            r.payload   = s.buf;
+            sessions_.erase(it);
+        }
+    }
+    else if (pci == 0x30)
+    {
+        r.kind = kFlowControl; // 流控帧不携带负载，不进入会话状态
+    }
+    return r;
+}
+
+void feedCanFrame(const unsigned char* data, uint32_t len, int linkType, IsoTpReassembler& isoTp)
+{
+    uint32_t canId = 0;
+    bool     extended = false;
+    const unsigned char* dptr = nullptr;
+    uint32_t              dlen = 0;
+    if (!extractCanPayload(data, len, linkType, canId, extended, dptr, dlen))
+        return;
+    if (dlen >= 1)
+        isoTp.feed(canId, dptr, dlen); // 仅预热重组状态；SF/FC 对重组器天然 no-op
+}
+
+bool parseFrame(const unsigned char* data, uint32_t len, Packet& packet, int linkType,
+                IsoTpReassembler* isoTp)
 {
     ProtocolDetail detail;
-    return parseFrameCtx(data, len, linkType, packet, detail);
+    return parseFrameCtx(data, len, linkType, packet, detail, isoTp);
 }
 
 // ---- 完整协议树 ----
@@ -997,18 +1525,17 @@ void addLeaf(const std::string& label, const std::string& value, DetailNode& roo
 } // namespace
 
 bool buildDetailTree(const unsigned char* data, uint32_t len, int linkType, uint32_t frameNumber,
-                     DetailNode& root)
+                     DetailNode& root, IsoTpReassembler* isoTp)
 {
     Packet p;
     ProtocolDetail detail;
-    if (!parseFrameCtx(data, len, linkType, p, detail))
+    if (!parseFrameCtx(data, len, linkType, p, detail, isoTp))
         return false;
     p.frame_number = frameNumber;
 
     root.label = "Frame " + std::to_string(frameNumber);
     char buf[128];
 
-    // Ethernet II / Null/Loopback
     DetailNode eth;
     if (!p.src_mac.empty())
     {
@@ -1044,8 +1571,30 @@ bool buildDetailTree(const unsigned char* data, uint32_t len, int linkType, uint
         root.children.push_back(ip);
     }
 
-    // 传输层
-    if (p.transport == "TCP" || p.transport == "UDP")
+    // CAN 层（SocketCAN / 原始 CAN / CAN FD 链路帧）
+    if (detail.can)
+    {
+        DetailNode cn;
+        cn.label = "Controller Area Network";
+        char cbuf[32];
+        if (detail.canExtended)
+            std::snprintf(cbuf, sizeof(cbuf), "0x%08x", detail.canId);
+        else
+            std::snprintf(cbuf, sizeof(cbuf), "0x%03x", detail.canId);
+        addChild(cn, "ID", cbuf);
+        addChild(cn, "Kind", detail.canKind);
+        if (detail.isoTpFrame && !detail.uds)
+        {
+            addChild(cn, "ISO-TP", detail.isoTpKind);
+            if (detail.isoTpKind[0] == 'F') // First Frame
+                addChild(cn, "Declared Length", std::to_string(detail.isoTpTotalLen));
+            else if (detail.isoTpKind[0] == 'C') // Consecutive Frame
+                addChild(cn, "Sequence", std::to_string(detail.isoTpSeq));
+        }
+        addChild(cn, "Info", p.info);
+        root.children.push_back(cn);
+    }
+    else if (p.transport == "TCP" || p.transport == "UDP")
     {
         DetailNode tr;
         tr.label = (p.transport == "TCP") ? "Transmission Control Protocol"
@@ -1075,7 +1624,36 @@ bool buildDetailTree(const unsigned char* data, uint32_t len, int linkType, uint
     }
 
     // 应用层分层
-    if (detail.http)
+    if (detail.doip)
+    {
+        DetailNode dp;
+        dp.label = "Diagnostic over IP";
+        addChild(dp, "Version", detail.doipVersion);
+        std::snprintf(buf, sizeof(buf), "%s (0x%04x)",
+                      detail.doipDesc ? detail.doipDesc : doipPayloadTypeName(detail.doipType),
+                      detail.doipType);
+        addChild(dp, "Payload Type", buf);
+        if (detail.uds)
+        {
+            DetailNode ud;
+            ud.label = "Unified Diagnostic Services";
+            addChild(ud, "Service", detail.udsService);
+            if (!detail.udsNrc.empty())
+                addChild(ud, "Negative Response Code", detail.udsNrc);
+            dp.children.push_back(ud);
+        }
+        root.children.push_back(dp);
+    }
+    else if (detail.uds) // CAN 负载上的 UDS（ISO-TP 单帧）
+    {
+        DetailNode ud;
+        ud.label = "Unified Diagnostic Services";
+        addChild(ud, "Service", detail.udsService);
+        if (!detail.udsNrc.empty())
+            addChild(ud, "Negative Response Code", detail.udsNrc);
+        root.children.push_back(ud);
+    }
+    else if (detail.http)
     {
         DetailNode hp;
         hp.label = "Hypertext Transfer Protocol";
@@ -1096,11 +1674,21 @@ bool buildDetailTree(const unsigned char* data, uint32_t len, int linkType, uint
         DetailNode tl;
         tl.label = "Transport Layer Security";
         addChild(tl, "Handshake", detail.tlsType);
-        if (!detail.tlsVersion.empty())
+        if (detail.tlsVersion)
             addChild(tl, "Version", detail.tlsVersion);
         if (!detail.tlsSni.empty())
             addChild(tl, "Server Name Indication", detail.tlsSni);
         root.children.push_back(tl);
+    }
+    else if (detail.ssh)
+    {
+        DetailNode sh;
+        sh.label = "SSH Protocol";
+        if (!detail.sshVersion.empty())
+            addChild(sh, "Protocol", detail.sshVersion);
+        else
+            addChild(sh, "Info", p.info);
+        root.children.push_back(sh);
     }
     else if (p.protocol == "DNS")
     {
@@ -1115,7 +1703,7 @@ bool buildDetailTree(const unsigned char* data, uint32_t len, int linkType, uint
     {
         DetailNode dh;
         dh.label = "Dynamic Host Configuration Protocol";
-        addChild(dh, "Message Type", detail.dhcpType);
+        addChild(dh, "Message Type", detail.dhcpType ? detail.dhcpType : "?");
         addChild(dh, "Info", p.info);
         root.children.push_back(dh);
     }
@@ -1314,6 +1902,11 @@ private:
             long        v  = std::strtol(value.c_str(), nullptr, 10);
             eq = [tp, v](const Packet& p) { return p.transport == tp && p.dst_port == v; };
         }
+        else if (field == "can.id") // 支持 0x 前缀十六进制或十进制
+        {
+            unsigned long v = std::strtoul(value.c_str(), nullptr, 0);
+            eq = [v](const Packet& p) { return p.can_id != 0 && p.can_id == v; };
+        }
         else
         {
             setErr("unsupported field '" + field + "'");
@@ -1341,6 +1934,11 @@ private:
         if (f == "ssh") return [](const Packet& p) { return p.protocol == "SSH"; };
         if (f == "dhcp") return [](const Packet& p) { return p.protocol == "DHCP"; };
         if (f == "ntp") return [](const Packet& p) { return p.protocol == "NTP"; };
+        if (f == "doip") return [](const Packet& p) { return p.is_doip; };
+        if (f == "uds") return [](const Packet& p) { return p.protocol == "UDS"; };
+        if (f == "can")
+            // 匹配 CAN / CAN FD / CAN FD BRS 等（canKind 前缀均为 "CAN"）
+            return [](const Packet& p) { return p.protocol.compare(0, 3, "CAN") == 0; };
         if (f == "ip") return [](const Packet& p) { return !p.src_ip.empty(); };
         if (f == "ipv6")
             return [](const Packet& p) { return p.src_ip.find(':') != std::string::npos; };

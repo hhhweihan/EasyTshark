@@ -1,12 +1,11 @@
 # EasyTshark - 网络数据包捕获与分析工具
 
 社区正式版由 **“轩辕之风”老师** 维护，见 [easytshark.com](https://www.easytshark.com/)。
+> 早期未完成的实现（仅含后端部分，无 GUI）保存在本仓库 [`feature/V1`](../../tree/feature/V1) 分支；当前分支是用AI重构后的版本。
 
 EasyTshark 支持实时抓包与离线 PCAP 分析、SQLite 存储、XML/JSON 格式转换，提供**命令行**、**原生图形界面**与**Web 界面**三种前端。
 
-**无需预装 Wireshark 即可开箱即用**：项目内置自研解析引擎（libpcap 抓包 + 内置协议解析），覆盖常用协议（Ethernet/VLAN/ARP/IPv4/IPv6/ICMP/TCP/UDP/DNS/HTTP/TLS/SSH 等）。安装 Wireshark 的 tshark 后可解锁**完整协议详情树、显示过滤、流量趋势**等增强能力（自动检测，无需配置）。
-
-> 早期未完成的实现（仅含后端部分，无 GUI）保存在 [`feature/V1`](../../tree/feature/V1) 分支；当前主线是重构后的完整版本。
+**无需预装 Wireshark 即可开箱即用**：项目内置自研解析引擎（libpcap 抓包 + 内置协议解析），覆盖常用协议（Ethernet/VLAN/ARP/IPv4/IPv6/ICMP/TCP/UDP/DNS/HTTP/TLS/SSH 等）与**汽车诊断协议**（DoIP / UDS / CAN / CAN FD）。安装 Wireshark 的 tshark 后可解锁**完整协议详情树、显示过滤、流量趋势**等增强能力（自动检测，无需配置）。
 
 ![图形界面](images/easytshark_gui.png)
 
@@ -19,6 +18,7 @@ EasyTshark 支持实时抓包与离线 PCAP 分析、SQLite 存储、XML/JSON �
 - **格式转换**：PCAP → tshark PDML(XML) → JSON；报文快照可导出 CSV（Web 界面有导出按钮）；离线分析支持 **pcapng**（自动识别，hex 视图正确）
 - **IP 地理位置**：基于 ip2region 自动解析归属地（库文件缺失时优雅降级为空归属地，不再退出程序）
 - **tshark 自动探测**：依次尝试环境变量 `EASYTSHARK_TSHARK`、平台默认路径、`PATH`、Windows 注册表；也可手动指定（无需重编译）
+- **汽车诊断协议**：DoIP（ISO 13400-2，TCP/UDP 13400，含车辆识别/路由激活/诊断消息）、UDS（ISO 14229-1，SID 服务名 + 正/负响应 + NRC 解释）、CAN/CAN FD（SocketCAN DLT 227 / 原始 CAN 228 / CAN FD 229 链路类型，EFF 扩展帧、BRS/ESI 标志、ISO-TP 单帧解包），支持显示过滤 `doip` / `uds` / `can` / `can.id`
 - **查询**：支持 MAC / IP / 端口 / 归属地模糊匹配（`*` 通配；字面 `%`/`_` 已转义），结果可导出 JSON
 - **Web 安全**：所有 `/api/*` 需 `X-Auth-Token`（启动时生成打印，可用 `EASYTSHARK_WEB_TOKEN`/`--token` 固定）+ Origin 校验；`/api/load` 与导出限用户主目录/`data/` 下
 - **大文件**：Web 报文列表分页拉取、实时缓冲有上限（长抓包丢弃最旧）；统计页带协议/IP 分布条形图

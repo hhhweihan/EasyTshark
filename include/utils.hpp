@@ -50,6 +50,18 @@ public:
      * @note 内部用 StringRef 引用 packets 的字符串内存，序列化期间入参须保持存活。
      */
     static std::string packetsToJson(const std::vector<std::shared_ptr<Packet>>& packets);
+
+    // 直接写入调用方 allocator 的 rapidjson 数组重载：供调用方把结果嵌进自己的 Document
+    // （如分页响应 {total,page,packets:[...]}），省去 packetsToJson 那版
+    // 序列化成字符串再 Parse 回 DOM 再深拷贝合并的三次往返。
+    static rapidjson::Value packetsToJsonValue(const std::vector<std::shared_ptr<Packet>>& packets,
+                                               rapidjson::Document::AllocatorType& allocator);
+    // 迭代器区间版本：分页切片场景直接传原快照的迭代器区间，不必先拷出一段
+    // vector<shared_ptr<Packet>>（每个元素都是一次原子 incref/decref）。
+    static rapidjson::Value
+    packetsToJsonValue(std::vector<std::shared_ptr<Packet>>::const_iterator begin,
+                       std::vector<std::shared_ptr<Packet>>::const_iterator end,
+                       rapidjson::Document::AllocatorType&                  allocator);
 };
 
 /**

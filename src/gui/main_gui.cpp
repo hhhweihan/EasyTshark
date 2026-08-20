@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -16,8 +17,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "imgui.h"
@@ -35,7 +36,6 @@ namespace
 
 using PacketPtr = std::shared_ptr<Packet>;
 
-// 文件是否已存在（保存前用来决定是否弹「覆盖确认」）。
 bool fileExists(const std::string& path)
 {
     if (path.empty())
@@ -44,15 +44,15 @@ bool fileExists(const std::string& path)
     return f.good();
 }
 
-// 文件名缺扩展名时补 .pcap。只看最后一段有无 '.'，避免把目录名里的点误判为扩展名。
-std::string withPcapSuffix(const std::string& path)
+// 文件名缺扩展名时补指定后缀。只看最后一段有无 '.'，避免把目录名里的点误判为扩展名。
+std::string withSuffix(const std::string& path, const char* ext)
 {
     if (path.empty())
         return path;
     size_t slash = path.find_last_of("/\\");
     size_t dot   = path.find_last_of('.');
     bool   hasExt = (dot != std::string::npos) && (slash == std::string::npos || dot > slash);
-    return hasExt ? path : path + ".pcap";
+    return hasExt ? path : path + ext;
 }
 
 // ---- 会话 / 统计聚合的数据结构 ----
@@ -60,12 +60,14 @@ std::string withPcapSuffix(const std::string& path)
 // 一条通信会话（按五元组归并的双向流）：端点、传输层、涉及的协议集合、包数/字节数。
 struct SessionInfo
 {
-    std::string           endpointA; // 规范化后较小的一端 "ip:port"
-    std::string           endpointB; // 较大的一端
-    std::string           transport; // TCP / UDP / 空
-    std::set<std::string> protocols; // 出现过的最高层协议（DNS/HTTP/TLS...）
-    uint64_t              packets = 0;
-    uint64_t              bytes   = 0;
+    std::string              endpointA; // 规范化后较小的一端 "ip:port"
+    std::string              endpointB; // 较大的一端
+    std::string              transport; // TCP / UDP / 空
+    // 出现过的最高层协议（DNS/HTTP/TLS...）：每会话通常 <10 种，线性查重比红黑树更快、无节点堆分配。
+    std::vector<std::string> protocols;
+    std::string              protocolsLabel; // protocols 逗号拼接，随聚合一次算好，供表格直接显示
+    uint64_t                 packets = 0;
+    uint64_t                 bytes   = 0;
 };
 
 // 计数条目（IP / 协议 / 归属地统计共用）：名字 + 包数 + 字节数。
@@ -84,9 +86,9 @@ struct AppState
     // 报文列表快照（从门面拷贝而来，UI 线程独占，绘制时不加锁）
     std::vector<PacketPtr> packets;
     PacketPtr              selectedPkt;        // 选中的报文（用指针而非下标，兼容分页/过滤）
-    std::vector<unsigned char> hex;            // 选中包的原始字节
-    uint32_t                   hexFrame = 0;   // hex 对应的帧号
-    DetailNode                 detail;         // 选中包的协议分层树
+    std::vector<unsigned char> hex;
+    uint32_t                   hexFrame = 0;
+    DetailNode                 detail;
     bool                       detailLoaded = false;
 
     // 过滤：view = 在 (全部 或 显示过滤结果) 基础上再按协议快速分类筛选后的可见集合
@@ -104,6 +106,7 @@ struct AppState
     // 离线载入 / 保存
     char pcapPathInput[512] = {0};
     char savePathInput[512] = {0};
+    char csvPathInput[512]  = {0};
     // 保存时目标文件已存在：暂存补全后的路径，弹「覆盖确认」再决定是否写入。
     std::string pendingSaveDest;
 
@@ -120,8 +123,10 @@ struct AppState
     bool                  liveCapturing = false;
     bool                  autoScroll    = true;
 
-    // 会话 / 统计的缓存：仅当报文数量变化时重建，避免每帧 O(N) 聚合。
-    size_t                   analyticsBuiltCount = (size_t)-1;
+    // 会话 / 统计的缓存：仅当报文数量变化时重建，避免每帧 O(N) 聚合。实时抓包时包数几乎每帧
+    // 都在涨，额外按 lastAnalyticsBuild 节流到约 300ms 一次，避免全量重新聚合跟渲染帧率走。
+    size_t                                analyticsBuiltCount = (size_t)-1;
+    std::chrono::steady_clock::time_point lastAnalyticsBuild;
     std::vector<SessionInfo> sessions;
     std::vector<CountItem>   ipStats;
     std::vector<CountItem>   protoStats;
@@ -170,7 +175,6 @@ bool containsIgnore(const std::string& hay, const char* needle)
     return hay.find(needle) != std::string::npos;
 }
 
-// 判断是否内网 / 环回地址（用于行内“内网”标签）。
 bool isPrivateIp(const std::string& ip)
 {
     if (ip.empty())
@@ -201,8 +205,17 @@ bool isPrivateIp(const std::string& ip)
 }
 
 // 协议名 → 颜色：为表格协议列提供彩色徽标，便于快速区分。
-ImVec4 protocolColor(const std::string& proto)
+// 计算本身是对短字符串做多次子串查找，代价不高，但每个可见行每帧都会重算一次；
+// 不同协议名种类很少（几十个封顶），用静态缓存换成一次哈希查找，且缓存生命周期
+// 与进程一致，不存在失效问题（协议名 → 颜色的映射关系本身就是纯函数、不会变化）。
+ImVec4 protocolColorUncached(const std::string& proto)
 {
+    if (containsIgnore(proto, "DoIP"))
+        return ImVec4(0.95f, 0.45f, 0.40f, 1.0f); // 红（Wireshark DoIP 色）
+    if (containsIgnore(proto, "UDS"))
+        return ImVec4(1.00f, 0.60f, 0.30f, 1.0f); // 橙
+    if (containsIgnore(proto, "CAN"))
+        return ImVec4(0.40f, 0.75f, 0.55f, 1.0f); // 绿
     if (containsIgnore(proto, "TCP"))
         return ImVec4(0.55f, 0.75f, 1.00f, 1.0f); // 蓝
     if (containsIgnore(proto, "UDP"))
@@ -220,6 +233,17 @@ ImVec4 protocolColor(const std::string& proto)
     if (containsIgnore(proto, "ARP"))
         return ImVec4(0.95f, 0.90f, 0.45f, 1.0f); // 黄
     return ImVec4(0.80f, 0.80f, 0.80f, 1.0f);
+}
+
+ImVec4 protocolColor(const std::string& proto)
+{
+    static std::unordered_map<std::string, ImVec4> cache;
+    auto                                            it = cache.find(proto);
+    if (it != cache.end())
+        return it->second;
+    ImVec4 c = protocolColorUncached(proto);
+    cache.emplace(proto, c);
+    return c;
 }
 
 // frame.time_epoch 格式化成本地时间 "MM-DD HH:MM:SS.mmm"。
@@ -452,12 +476,28 @@ void ensureAnalytics(AppState& s)
 {
     if (s.analyticsBuiltCount == s.packets.size())
         return;
+    if (s.liveCapturing)
+    {
+        auto now = std::chrono::steady_clock::now();
+        if (now - s.lastAnalyticsBuild < std::chrono::milliseconds(300))
+            return;
+        s.lastAnalyticsBuild = now;
+    }
     s.analyticsBuiltCount = s.packets.size();
 
     // 会话：按五元组（规范化端点对）归并
-    std::map<std::string, SessionInfo> sessMap;
+    std::unordered_map<std::string, SessionInfo> sessMap;
     // 统计：IP / 协议 / 归属地 计数
-    std::map<std::string, CountItem> ipMap, protoMap, locMap;
+    std::unordered_map<std::string, CountItem> ipMap, protoMap, locMap;
+
+    // 会话协议集合去重追加：每会话协议种类很少，线性查找比 std::set 更快、无红黑树节点分配。
+    auto addProtocol = [](SessionInfo& si, const std::string& proto)
+    {
+        for (const std::string& existing : si.protocols)
+            if (existing == proto)
+                return;
+        si.protocols.push_back(proto);
+    };
 
     for (const PacketPtr& pp : s.packets)
     {
@@ -477,7 +517,29 @@ void ensureAnalytics(AppState& s)
                 si.transport = p.transport;
             }
             if (!p.protocol.empty())
-                si.protocols.insert(p.protocol);
+                addProtocol(si, p.protocol);
+            si.packets++;
+            si.bytes += p.len;
+        }
+        // CAN 链路报文无 IP 层，按唯一 CAN ID 归并成一条"会话"（总线广播，无点对点概念）。
+        // 判定：CAN 链路从不经过 parseTcp/parseUdp，故 transport 恒为空；protocol 只会是
+        // "UDS"（直接 UDS-over-CAN / ISO-TP 重组完成）或以 "CAN" 开头（普通 CAN/CAN FD 帧）。
+        else if (p.transport.empty() &&
+                 (p.protocol.compare(0, 3, "CAN") == 0 || p.protocol == "UDS"))
+        {
+            char keyBuf[32];
+            std::snprintf(keyBuf, sizeof(keyBuf), "CAN|%u", p.can_id);
+            SessionInfo& si = sessMap[keyBuf];
+            if (si.packets == 0)
+            {
+                char idBuf[24];
+                std::snprintf(idBuf, sizeof(idBuf), "CAN ID 0x%x", p.can_id);
+                si.endpointA = idBuf;
+                si.endpointB = "(总线广播)";
+                si.transport = "CAN";
+            }
+            if (!p.protocol.empty())
+                addProtocol(si, p.protocol);
             si.packets++;
             si.bytes += p.len;
         }
@@ -514,7 +576,7 @@ void ensureAnalytics(AppState& s)
         }
     }
 
-    auto toSortedVec = [](std::map<std::string, CountItem>& m)
+    auto toSortedVec = [](std::unordered_map<std::string, CountItem>& m)
     {
         std::vector<CountItem> v;
         v.reserve(m.size());
@@ -528,7 +590,12 @@ void ensureAnalytics(AppState& s)
     s.sessions.clear();
     s.sessions.reserve(sessMap.size());
     for (auto& kv : sessMap)
-        s.sessions.push_back(kv.second);
+    {
+        SessionInfo& si = kv.second;
+        for (const std::string& pr : si.protocols)
+            si.protocolsLabel += (si.protocolsLabel.empty() ? "" : ",") + pr;
+        s.sessions.push_back(std::move(si));
+    }
     std::sort(s.sessions.begin(), s.sessions.end(),
               [](const SessionInfo& x, const SessionInfo& y) { return x.packets > y.packets; });
 
@@ -560,6 +627,12 @@ bool sessionMatches(const SessionInfo& si, int cat)
         return hasProto("TLS") || hasProto("SSL");
     case 6:
         return hasProto("SSH");
+    case 7:
+        return hasProto("DoIP");
+    case 8:
+        return hasProto("UDS");
+    case 9:
+        return si.transport == "CAN";
     default:
         return true;
     }
@@ -596,7 +669,7 @@ void drawToolbar(AppState& s)
     ImGui::BeginDisabled(s.busy || s.session.pcapPath().empty());
     if (ImGui::Button("保存"))
     {
-        std::string dest = withPcapSuffix(s.savePathInput); // 缺后缀补 .pcap
+        std::string dest = withSuffix(s.savePathInput, ".pcap");
         if (dest.empty())
         {
             s.status = "请先填写保存路径";
@@ -611,6 +684,24 @@ void drawToolbar(AppState& s)
         {
             s.status = s.session.savePcapAs(dest) ? ("已保存: " + dest) : "保存失败";
         }
+    }
+    ImGui::EndDisabled();
+
+    ImGui::SameLine();
+    ImGui::TextUnformatted("  |  导出CSV:");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(240);
+    ImGui::InputTextWithHint("##csvpath", "导出为 .csv 路径（缺目录会自动创建）", s.csvPathInput,
+                             sizeof(s.csvPathInput));
+    ImGui::SameLine();
+    ImGui::BeginDisabled(s.busy || s.session.pcapPath().empty());
+    if (ImGui::Button("导出CSV"))
+    {
+        std::string dest = withSuffix(s.csvPathInput, ".csv");
+        if (dest.empty())
+            s.status = "请先填写导出路径";
+        else
+            s.status = s.session.exportPacketsCsv(dest) ? ("已导出: " + dest) : "导出失败";
     }
     ImGui::EndDisabled();
 
@@ -810,12 +901,13 @@ void drawPacketRow(AppState& s, const PacketPtr& p)
     }
 
     ImGui::TableSetColumnIndex(1);
-    ImGui::TextUnformatted(formatEpoch(p->time).c_str());
+    if (p->display_time_cache.empty() && p->time > 0.0)
+        p->display_time_cache = formatEpoch(p->time);
+    ImGui::TextUnformatted(p->display_time_cache.c_str());
 
     ImGui::TableSetColumnIndex(2);
     ImGui::Text("%.6f", p->time);
 
-    // 源 IP/Mac（+ 内网标签）
     ImGui::TableSetColumnIndex(3);
     ImGui::TextUnformatted(p->src_ip.empty() ? p->src_mac.c_str() : p->src_ip.c_str());
     if (isPrivateIp(p->src_ip))
@@ -829,7 +921,6 @@ void drawPacketRow(AppState& s, const PacketPtr& p)
     if (p->src_port)
         ImGui::Text("%u", p->src_port);
 
-    // 目的 IP/Mac（+ 内网标签）
     ImGui::TableSetColumnIndex(6);
     ImGui::TextUnformatted(p->dst_ip.empty() ? p->dst_mac.c_str() : p->dst_ip.c_str());
     if (isPrivateIp(p->dst_ip))
@@ -843,7 +934,6 @@ void drawPacketRow(AppState& s, const PacketPtr& p)
     if (p->dst_port)
         ImGui::Text("%u", p->dst_port);
 
-    // 协议（彩色徽标）
     ImGui::TableSetColumnIndex(9);
     ImGui::TextColored(protocolColor(p->protocol), "%s", p->protocol.c_str());
 
@@ -851,6 +941,11 @@ void drawPacketRow(AppState& s, const PacketPtr& p)
     ImGui::Text("%u", p->len);
     ImGui::TableSetColumnIndex(11);
     ImGui::TextUnformatted(p->info.c_str());
+
+    // 进程归属（仅实时抓包时可能有值；离线回放/未命中恒为空）
+    ImGui::TableSetColumnIndex(12);
+    if (p->proc_pid)
+        ImGui::Text("%s (%d)", p->proc_name.c_str(), p->proc_pid);
 }
 
 void drawPacketTable(AppState& s)
@@ -876,9 +971,8 @@ void drawPacketTable(AppState& s)
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
                                   ImGuiTableFlags_Resizable;
-    // 表格占据除底部分页条外的空间
     float tableHeight = ImGui::GetContentRegionAvail().y - (s.liveCapturing ? 0.0f : 34.0f);
-    if (ImGui::BeginTable("packets", 12, flags, ImVec2(0, tableHeight)))
+    if (ImGui::BeginTable("packets", 13, flags, ImVec2(0, tableHeight)))
     {
         // 冻结表头行 + 首列（No.）：横向滚动时帧号始终可见，便于对照
         ImGui::TableSetupScrollFreeze(1, 1);
@@ -894,6 +988,7 @@ void drawPacketTable(AppState& s)
         ImGui::TableSetupColumn("协议", ImGuiTableColumnFlags_WidthFixed, 70);
         ImGui::TableSetupColumn("大小", ImGuiTableColumnFlags_WidthFixed, 55);
         ImGui::TableSetupColumn("信息", ImGuiTableColumnFlags_WidthFixed, 600);
+        ImGui::TableSetupColumn("进程", ImGuiTableColumnFlags_WidthFixed, 140);
         ImGui::TableHeadersRow();
 
         if (s.liveCapturing)
@@ -909,7 +1004,6 @@ void drawPacketTable(AppState& s)
         }
         else
         {
-            // 离线：分页渲染当前页切片
             int begin = s.page * s.pageSize;
             int end   = std::min((int)s.view.size(), begin + s.pageSize);
             for (int row = begin; row < end; row++)
@@ -951,22 +1045,21 @@ void drawPacketTable(AppState& s)
 }
 
 // 递归渲染协议分层树的一个节点
-void renderDetailNode(const DetailNode& n, int idx)
+void renderDetailNode(DetailNode& n, int idx)
 {
     ImGui::PushID(idx);
     if (n.children.empty())
     {
-        std::string text = n.label;
-        if (!n.value.empty())
-            text += ": " + n.value;
-        ImGui::TreeNodeEx(text.c_str(), ImGuiTreeNodeFlags_Leaf |
+        if (n.display_text_cache.empty())
+            n.display_text_cache = n.value.empty() ? n.label : n.label + ": " + n.value;
+        ImGui::TreeNodeEx(n.display_text_cache.c_str(), ImGuiTreeNodeFlags_Leaf |
                                             ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                             ImGuiTreeNodeFlags_Bullet);
     }
     else if (ImGui::TreeNode(n.label.c_str()))
     {
         int i = 0;
-        for (const DetailNode& c : n.children)
+        for (DetailNode& c : n.children)
             renderDetailNode(c, i++);
         ImGui::TreePop();
     }
@@ -994,7 +1087,7 @@ void drawDetail(AppState& s)
     if (s.detailLoaded && !s.detail.children.empty())
     {
         int i = 0;
-        for (const DetailNode& proto : s.detail.children)
+        for (DetailNode& proto : s.detail.children)
             renderDetailNode(proto, i++);
     }
     else if (s.detailPending.valid())
@@ -1040,15 +1133,19 @@ void drawSessions(AppState& s)
     ImGui::SameLine();
     ImGui::SetNextItemWidth(160);
     const char* cats[] = {"全部会话", "TCP会话", "UDP会话", "DNS会话",
-                          "HTTP会话", "SSL/TLS会话", "SSH会话"};
+                          "HTTP会话", "SSL/TLS会话", "SSH会话",
+                          "DoIP会话", "UDS会话", "CAN会话"};
     ImGui::Combo("##sesscat", &s.sessionCategory, cats, IM_ARRAYSIZE(cats));
 
-    size_t shown = 0;
-    for (const SessionInfo& si : s.sessions)
-        if (sessionMatches(si, s.sessionCategory))
-            shown++;
+    // 先按分类过滤物化出可见下标数组，再对该数组做 clipper 虚拟化（不能直接对 s.sessions
+    // 做 clipper，因为分类过滤后可见行数与总行数不一致）。
+    std::vector<size_t> visible;
+    visible.reserve(s.sessions.size());
+    for (size_t i = 0; i < s.sessions.size(); ++i)
+        if (sessionMatches(s.sessions[i], s.sessionCategory))
+            visible.push_back(i);
     ImGui::SameLine();
-    ImGui::Text("  共 %zu 个会话", shown);
+    ImGui::Text("  共 %zu 个会话", visible.size());
 
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
@@ -1063,27 +1160,26 @@ void drawSessions(AppState& s)
         ImGui::TableSetupColumn("字节", ImGuiTableColumnFlags_WidthFixed, 90);
         ImGui::TableHeadersRow();
 
-        for (const SessionInfo& si : s.sessions)
-        {
-            if (!sessionMatches(si, s.sessionCategory))
-                continue;
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(si.endpointA.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(si.endpointB.c_str());
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(si.transport.c_str());
-            ImGui::TableSetColumnIndex(3);
-            std::string protos;
-            for (const std::string& pr : si.protocols)
-                protos += (protos.empty() ? "" : ",") + pr;
-            ImGui::TextUnformatted(protos.c_str());
-            ImGui::TableSetColumnIndex(4);
-            ImGui::Text("%llu", (unsigned long long)si.packets);
-            ImGui::TableSetColumnIndex(5);
-            ImGui::Text("%llu", (unsigned long long)si.bytes);
-        }
+        ImGuiListClipper clipper;
+        clipper.Begin((int)visible.size());
+        while (clipper.Step())
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++)
+            {
+                const SessionInfo& si = s.sessions[visible[row]];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(si.endpointA.c_str());
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(si.endpointB.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(si.transport.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(si.protocolsLabel.c_str());
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%llu", (unsigned long long)si.packets);
+                ImGui::TableSetColumnIndex(5);
+                ImGui::Text("%llu", (unsigned long long)si.bytes);
+            }
         ImGui::EndTable();
     }
 }
@@ -1100,16 +1196,20 @@ void drawCountTable(const char* id, const char* nameCol, const std::vector<Count
         ImGui::TableSetupColumn("包数", ImGuiTableColumnFlags_WidthFixed, 80);
         ImGui::TableSetupColumn("字节", ImGuiTableColumnFlags_WidthFixed, 100);
         ImGui::TableHeadersRow();
-        for (const CountItem& c : items)
-        {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(c.name.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImGui::Text("%llu", (unsigned long long)c.packets);
-            ImGui::TableSetColumnIndex(2);
-            ImGui::Text("%llu", (unsigned long long)c.bytes);
-        }
+        ImGuiListClipper clipper;
+        clipper.Begin((int)items.size());
+        while (clipper.Step())
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++)
+            {
+                const CountItem& c = items[row];
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextUnformatted(c.name.c_str());
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%llu", (unsigned long long)c.packets);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%llu", (unsigned long long)c.bytes);
+            }
         ImGui::EndTable();
     }
 }
@@ -1336,11 +1436,6 @@ int main(int, char**)
             if (ImGui::BeginTabItem("查询"))
             {
                 drawQuery(state);
-                ImGui::EndTabItem();
-            }
-            if (ImGui::BeginTabItem("进程分析"))
-            {
-                ImGui::TextDisabled("进程分析（socket→进程 映射）依赖平台特定能力，暂未实现。");
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
