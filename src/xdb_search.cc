@@ -119,8 +119,11 @@ xdb_search_t::xdb_search_t(const std::string &file_name) {
     vector_index = NULL;
     content      = NULL;
 
-    if (db == NULL)
-        log_exit("can't open " + file_name);
+    if (db == NULL) {
+        // 不 exit(-1)：IP 地理库缺失时整个程序退出会拖垮抓包/分析主流程。
+        // 保持 db==NULL 的失败态，调用方（IP2RegionUtil）经 is_ok() 降级为空归属地。
+        std::cout << "can't open " + file_name << std::endl;
+    }
 }
 
 void xdb_search_t::init_file() {

@@ -11,6 +11,16 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(_WIN32)
+#include <direct.h> // _findfirst/_findnext 用到的头在 <io.h>
+#include <io.h>
+#include <sys/stat.h>
+#else
+#include <dirent.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#endif
+
 #include "loguru/loguru.hpp"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
@@ -38,7 +48,6 @@ std::unordered_map<std::string, std::string> translationMap = {
     {"Time delta from previous captured frame", "与上一个捕获帧的时间差"},
     {"Time delta from previous displayed frame", "与上一个显示帧的时间差"},
     {"Time since reference or first frame", "自参考帧或第一帧以来的时间"},
-    {"Frame Number", "帧编号"},
     {"Frame Length", "帧长度"},
     {"Capture Length", "捕获长度"},
     {"Frame is marked", "帧标记"},
@@ -122,8 +131,7 @@ std::string IP2RegionUtil::getIpLocation(const std::string& ip)
         return "";
     }
 
-    // 记忆化：少数 IP 贡献绝大多数报文，命中缓存即跳过 xdb 查表与 parseLocation 分配。
-    // 离线分析与抓包线程可能并发调用，用静态 mutex 守护。
+    // 记忆化：少数 IP 贡献绝大多数报文；离线与抓包线程并发调用，用静态 mutex 守护。
     static std::unordered_map<std::string, std::string> locationCache;
     static std::mutex                                    cacheMutex;
     {
@@ -157,8 +165,7 @@ std::string IP2RegionUtil::parseLocation(const std::string& input)
         return "内网";
     }
 
-    // 按 '|' 切分为「国家|区域|省份|城市|ISP」5 段。手动扫描按需 substr，
-    // 免去 stringstream + getline 每次构造流对象的开销。
+    // 按 '|' 切分为「国家|区域|省份|城市|ISP」5 段（手动扫描避免 stringstream 开销）。
     std::string tokens[5];
     int         count = 0;
     size_t      start = 0;
@@ -200,9 +207,8 @@ std::string IP2RegionUtil::parseLocation(const std::string& input)
 
 bool IP2RegionUtil::init(const std::string& xdbFilePath)
 {
-    // 只初始化一次：xdb 文件较大，离线分析与抓包线程都会调用 init。call_once
-    // 保证仅加载一次，并对所有调用线程建立 happens-before，之后读 xdbPtr 皆安全。
-    // 加载失败置空并返回 false，不让异常沿离线分析路径冒泡到 UI 线程。
+    // call_once 保证 xdb 只加载一次并对所有调用线程建立 happens-before；
+    // 加载失败置空返回 false，不让异常冒泡到 UI 线程。
     static std::once_flag initFlag;
     std::call_once(initFlag,
                    [&xdbFilePath]()
@@ -211,6 +217,11 @@ bool IP2RegionUtil::init(const std::string& xdbFilePath)
                        {
                            std::shared_ptr<xdb_search_t> p =
                                std::make_shared<xdb_search_t>(xdbFilePath);
+                           if (!p->is_ok())
+                           {
+                               xdbPtr = nullptr; // 库文件缺失：降级为空归属地
+                               return;
+                           }
                            p->init_content();
                            xdbPtr = p;
                        }
@@ -228,8 +239,7 @@ std::string CommonUtil::get_timestamp()
     auto now_time = std::chrono::system_clock::to_time_t(now);
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
-    // std::localtime 返回指向共享静态缓冲区的指针，并发调用会相互覆盖（数据竞争）。
-    // 改用可重入版本写入线程内的 tm：POSIX 用 localtime_r，Windows 用 localtime_s。
+    // localtime 用共享静态缓冲，并发有数据竞争；改用可重入版写线程内 tm。
     std::tm tm_buf{};
 #if defined(_WIN32)
     localtime_s(&tm_buf, &now_time);
@@ -243,13 +253,69 @@ std::string CommonUtil::get_timestamp()
 
     return ss.str();
 }
+void CommonUtil::pruneLogFiles(const std::string& dir, size_t keep)
+{
+#if defined(_WIN32)
+    // Windows 下用 _findfirst/_findnext 枚举 *.log；按文件名时间戳排序后删除最旧的。
+    std::vector<std::string> files;
+    std::string              pattern = dir + "\\*.log";
+    struct _finddata_t       fd;
+    intptr_t                 h = _findfirst(pattern.c_str(), &fd);
+    if (h == -1)
+        return; // 目录不存在 / 无匹配
+    do
+    {
+        if (fd.name[0] != '.')
+            files.push_back(dir + "\\" + fd.name);
+    } while (_findnext(h, &fd) == 0);
+    _findclose(h);
+#else
+    std::vector<std::string> files;
+    DIR*                     d = opendir(dir.c_str());
+    if (!d)
+        return;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr)
+    {
+        std::string name = ent->d_name;
+        // 只匹配 .log 后缀（日志文件命名规则）
+        if (name.size() > 4 && name.compare(name.size() - 4, 4, ".log") == 0)
+            files.push_back(dir + "/" + name);
+    }
+    closedir(d);
+#endif
+    if (files.size() <= keep)
+        return;
+
+    // 按最后修改时间升序（最旧在前），删除超出的最旧文件
+    std::sort(files.begin(), files.end(),
+              [](const std::string& a, const std::string& b)
+              {
+#if defined(_WIN32)
+                  struct _stat stA, stB;
+                  if (_stat(a.c_str(), &stA) != 0)
+                      return false;
+                  if (_stat(b.c_str(), &stB) != 0)
+                      return true;
+                  return stA.st_mtime < stB.st_mtime;
+#else
+                  struct stat stA, stB;
+                  if (stat(a.c_str(), &stA) != 0)
+                      return false;
+                  if (stat(b.c_str(), &stB) != 0)
+                      return true;
+                  return stA.st_mtime < stB.st_mtime;
+#endif
+              });
+    for (size_t i = 0; i < files.size() - keep; ++i)
+        std::remove(files[i].c_str());
+}
+
 
 
 namespace
 {
-// 前缀树（trie）：在 O(待匹配串长) 内找出 showname 的最长匹配前缀。
-// 取代原先对约 80 条词典逐条 find(key)==0 的 O(串长×词典大小) 扫描，
-// 且总是选中最长（最具体）的前缀，结果确定。
+// 前缀树：O(串长) 找出 showname 的最长匹配前缀，取代对词典逐条 find 的扫描，且总选最长前缀。
 class TranslationTrie
 {
 public:
@@ -379,12 +445,9 @@ SQLiteUtil::SQLiteUtil(const std::string& dbname)
         throw std::runtime_error("Failed to open database");
     }
 
-    // 该库是可从 pcap 随时重建的「派生缓存」，无需为掉电持久化付出每次 COMMIT
-    // 都 fsync 的代价（fsync 会让入库流水线卡在磁盘 I/O 上）：
-    //   - journal_mode=MEMORY：回滚日志放内存，省去日志文件创建与 fsync；
-    //   - synchronous=OFF：COMMIT 不再 fsync（掉电可能损坏，但源头 pcap 仍在，可重建）；
-    //   - temp_store=MEMORY：临时表/索引走内存。
-    // PRAGMA 失败只会退回更慢但同样正确的默认行为，故不因此中断构造。
+    // 该库可从 pcap 随时重建（派生缓存），故牺牲持久化换性能：journal_mode=MEMORY /
+    // synchronous=OFF（COMMIT 不 fsync）/ temp_store=MEMORY。掉电可能损坏，但源头 pcap 仍在。
+    // PRAGMA 失败会退回更慢但同样正确的默认，不因此中断构造。
     sqlite3_exec(db, "PRAGMA journal_mode = MEMORY;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA synchronous = OFF;", nullptr, nullptr, nullptr);
     sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", nullptr, nullptr, nullptr);
@@ -452,14 +515,15 @@ bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
     if (sqlite3_prepare_v2(db, insertSQL.c_str(), -1, &stmt, nullptr) != SQLITE_OK)
     {
         LOG_F(ERROR, "Failed to prepare insert statement: %s", sqlite3_errmsg(db));
+        // 上面已 BEGIN，此处失败必须回滚，否则事务悬挂在连接上直至对象销毁。
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
         return false;
     }
 
     bool hasError = false;
     for (const auto& packet : packets)
     {
-        // 文本列传入显式长度（.size()）而非 -1：-1 会让 SQLite 对每串各做一次
-        // strlen，批量 N 包 × 8 列即 8N 次全串扫描。SQLITE_STATIC 表示不拷贝，
+        // 文本列传显式长度而非 -1，省去 SQLite 对每串的 strlen；SQLITE_STATIC 不拷贝，
         // 字符串由 packet 在本次事务结束前持有。
         sqlite3_bind_int(stmt, 1, packet->frame_number);
         sqlite3_bind_double(stmt, 2, packet->time);
@@ -516,16 +580,14 @@ bool SQLiteUtil::insertPacket(std::vector<std::shared_ptr<Packet>>& packets)
 
 namespace
 {
-// sqlite3_column_text 对 NULL 列返回 nullptr，直接拿来构造 std::string 是未定义行为。
-// 统一经此 helper 读取文本列：NULL 一律按空串处理。
+// sqlite3_column_text 对 NULL 列返回 nullptr，直接构造 std::string 是 UB；统一按空串处理。
 std::string columnText(sqlite3_stmt* stmt, int col)
 {
     const unsigned char* text = sqlite3_column_text(stmt, col);
     return text ? reinterpret_cast<const char*>(text) : std::string();
 }
 
-// 把 t_packets 的一行读进 Packet：queryPacket / queryPackets 共用同一列序，
-// 抽出来消除两处几乎重复的读列逻辑，并统一走 NULL 安全的 columnText。
+// 把 t_packets 一行读进 Packet；queryPacket/queryPackets 共用，统一走 NULL 安全的 columnText。
 std::shared_ptr<Packet> rowToPacket(sqlite3_stmt* stmt)
 {
     std::shared_ptr<Packet> packet = std::make_shared<Packet>();
@@ -580,6 +642,21 @@ bool SQLiteUtil::queryPacket(std::vector<std::shared_ptr<Packet>>& packetList, i
     return true;
 }
 
+// LIKE 模式转义：字面 %/_ 转义（SQL 侧 ESCAPE '\\'），避免用户输入的通配符意外全匹配；
+// * 保留为模糊符（转义在 replace 之前做，故不受影响）。
+std::string escapeLikePattern(const std::string& raw)
+{
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw)
+    {
+        if (c == '%' || c == '_' || c == '\\')
+            out.push_back('\\'); // 反斜杠本身也转义，保持模式可预测
+        out.push_back(c);
+    }
+    return out;
+}
+
 std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>& conditions,
                                         std::vector<BindParam>&                   params)
 {
@@ -591,23 +668,25 @@ std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>
         if (condition.first == "mac_address")
         {
             std::string pattern = condition.second;
-            std::replace(pattern.begin(), pattern.end(), '*', '%');
-            // 用 ? 占位、两个源/目的字段各绑定一次，用户输入不进入 SQL 文本
-            sql += " AND (src_mac LIKE ? OR dst_mac LIKE ?)";
+            pattern             = escapeLikePattern(pattern); // 先转义字面 %/_
+            std::replace(pattern.begin(), pattern.end(), '*', '%'); // 再展开模糊符
+            sql += " AND (src_mac LIKE ? ESCAPE '\\' OR dst_mac LIKE ? ESCAPE '\\')";
             params.push_back({BindParam::Text, pattern, 0});
             params.push_back({BindParam::Text, pattern, 0});
         }
         else if (condition.first == "ip_address")
         {
             std::string pattern = condition.second;
+            pattern             = escapeLikePattern(pattern);
             std::replace(pattern.begin(), pattern.end(), '*', '%');
-            sql += " AND (src_ip LIKE ? OR dst_ip LIKE ?)";
+            sql += " AND (src_ip LIKE ? ESCAPE '\\' OR dst_ip LIKE ? ESCAPE '\\')";
             params.push_back({BindParam::Text, pattern, 0});
             params.push_back({BindParam::Text, pattern, 0});
         }
         else if (condition.first == "port")
         {
             std::string pattern = condition.second;
+            pattern             = escapeLikePattern(pattern);
             std::replace(pattern.begin(), pattern.end(), '*', '%');
             // 纯数字则按整数精确匹配，否则按文本模糊匹配（避免 stoi 抛异常）
             bool numeric = !pattern.empty() &&
@@ -622,7 +701,7 @@ std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>
             }
             else
             {
-                sql += " AND (CAST(src_port AS TEXT) LIKE ? OR CAST(dst_port AS TEXT) LIKE ?)";
+                sql += " AND (CAST(src_port AS TEXT) LIKE ? ESCAPE '\\' OR CAST(dst_port AS TEXT) LIKE ? ESCAPE '\\')";
                 params.push_back({BindParam::Text, pattern, 0});
                 params.push_back({BindParam::Text, pattern, 0});
             }
@@ -630,12 +709,11 @@ std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>
         else if (condition.first == "location")
         {
             std::string pattern = condition.second;
+            pattern             = escapeLikePattern(pattern);
             std::replace(pattern.begin(), pattern.end(), '*', '%');
-            // 地理位置一律做任意位置的子串匹配：无条件在前后各加一个 %。
-            // 即使用户输入本身已含 *（如 "湖南*长沙"→"湖南%长沙"），也要补成
-            // "%湖南%长沙%" 才能匹配 "中国-湖南省-长沙市"；多余的 %% 等价单个 %，无害。
+            // 地理位置一律做子串匹配：前后各加一个 %（即便输入已含 *，也要补 %...% 才能匹配）。
             pattern = "%" + pattern + "%";
-            sql += " AND (src_location LIKE ? OR dst_location LIKE ?)";
+            sql += " AND (src_location LIKE ? ESCAPE '\\' OR dst_location LIKE ? ESCAPE '\\')";
             params.push_back({BindParam::Text, pattern, 0});
             params.push_back({BindParam::Text, pattern, 0});
         }
@@ -659,8 +737,7 @@ std::string CommonUtil::packetsToJson(const std::vector<std::shared_ptr<Packet>>
     {
         rapidjson::Value packetObj(rapidjson::kObjectType);
 
-        // 字符串字段使用StringRef引用Packet中已有的内存，避免把每个字符串再拷贝进allocator。
-        // packet在本函数序列化完成前始终存活，不会悬垂。
+        // StringRef 引用 Packet 已有内存，避免再拷贝；packet 在序列化完成前存活，不悬垂。
         packetObj.AddMember("frame_number", rapidjson::Value(packet->frame_number), allocator);
         packetObj.AddMember("time", rapidjson::Value(packet->time), allocator);
         packetObj.AddMember("cap_len", rapidjson::Value(packet->cap_len), allocator);

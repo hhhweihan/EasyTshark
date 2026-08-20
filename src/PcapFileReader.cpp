@@ -6,9 +6,8 @@
 
 #if defined(_WIN32)
 // ============================================================================
-// 非 POSIX 兜底实现：std::ifstream + seekg/read
-// 一次打开、多次随机读，省去重复 open()/close() 并复用文件流缓冲。
-// Windows 侧暂未用原生内存映射（CreateFileMapping/MapViewOfFile），以文件流兜底。
+// 非 POSIX 兜底实现：std::ifstream + seekg/read（一次打开、多次随机读，复用文件流缓冲）。
+// Windows 暂未用原生内存映射（CreateFileMapping/MapViewOfFile）。
 // ============================================================================
 
 PcapFileReader::PcapFileReader() : size_(0) {}
@@ -54,6 +53,24 @@ bool PcapFileReader::readAt(uint64_t offset, uint32_t len, std::vector<unsigned 
     return static_cast<bool>(stream_);
 }
 
+const unsigned char* PcapFileReader::viewAt(uint64_t offset, uint32_t len) const
+{
+    if (!stream_.is_open() || offset > size_ || len > size_ - offset)
+    {
+        return nullptr;
+    }
+    // 无内存映射：读入复用缓冲再借出指针（下次调用即失效，见头注释契约）。
+    viewBuf_.resize(len);
+    stream_.clear();
+    stream_.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+    stream_.read(reinterpret_cast<char*>(viewBuf_.data()), len);
+    if (!stream_)
+    {
+        return nullptr;
+    }
+    return viewBuf_.data();
+}
+
 void PcapFileReader::close()
 {
     if (stream_.is_open())
@@ -70,9 +87,8 @@ bool PcapFileReader::isOpen() const
 
 #else
 // ============================================================================
-// POSIX 实现：mmap 整个文件后按 offset 直接切片
-// 随机访问免去 lseek+read 双系统调用与一次内核→用户拷贝，
-// 页面靠缺页中断按需调入；MAP_PRIVATE + PROT_READ 只读映射，不影响原文件。
+// POSIX 实现：mmap 整个文件后按 offset 直接切片（随机访问免 lseek+read 与内核拷贝）。
+// 页面靠缺页按需调入；MAP_PRIVATE + PROT_READ 只读映射，不影响原文件。
 // ============================================================================
 
 #include <fcntl.h>
@@ -114,9 +130,8 @@ bool PcapFileReader::open(const std::string& path)
         return false;
     }
 
-    // readAt 是「按包偏移读一小段」的随机访问。内核默认按顺序访问对缺页做预读，
-    // 会把相邻页一并调入，对随机小读纯属浪费；MADV_RANDOM 关掉预读，只调入命中页。
-    // 提示失败不影响正确性（退回默认预读），故忽略返回值。
+    // readAt 是随机小读，内核默认顺序预读会白调相邻页；MADV_RANDOM 关掉预读，只调命中页。
+    // 提示失败不影响正确性（退回默认预读），忽略返回值。
     ::posix_madvise(addr, static_cast<size_t>(st.st_size), POSIX_MADV_RANDOM);
 
     fd_     = fd;
@@ -142,6 +157,16 @@ bool PcapFileReader::readAt(uint64_t offset, uint32_t len, std::vector<unsigned 
     out.resize(len);
     std::memcpy(out.data(), static_cast<const unsigned char*>(mapped_) + offset, len);
     return true;
+}
+
+const unsigned char* PcapFileReader::viewAt(uint64_t offset, uint32_t len) const
+{
+    if (mapped_ == nullptr || offset > size_ || len > size_ - offset)
+    {
+        return nullptr;
+    }
+    // 直接指向映射区：零拷贝、零分配，指针在 reader 存活期间全程有效。
+    return static_cast<const unsigned char*>(mapped_) + offset;
 }
 
 void PcapFileReader::close()

@@ -11,7 +11,22 @@ project(EasyTshark_xuanyuan VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}/output")
+# 关闭编译器 GNU 扩展：用严格 -std=c++11 而非 -std=gnu++11，真正锁死 C++11 目标
+# （本项目刻意固定 C++11，贴合保守工具链），让误用的 GNU/更高标准构造在本机就暴露。
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# 单 config 生成器（Makefile/Ninja）在未指定 CMAKE_BUILD_TYPE 时，编译标志为空
+# ——即 -O0 无优化。解析引擎是纯计算热点，-O0→-O2 通常有数倍差距，故给个默认值。
+# 多 config 生成器（Visual Studio / Xcode）由 --config 决定，带 CMAKE_CONFIGURATION_TYPES，
+# 此处不覆盖它们。用户仍可用 -DCMAKE_BUILD_TYPE=Debug 显式改回。
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "构建类型（默认 Release）" FORCE)
+endif()
+# 产物输出目录：默认 output/（源码树内，脚本/README 的约定路径）；
+# 需要 out-of-source 干净构建时可 -DEASYTSHARK_OUTPUT_DIR=/path 覆盖。
+set(EASYTSHARK_OUTPUT_DIR "${CMAKE_SOURCE_DIR}/output" CACHE PATH
+    "构建产物输出目录（默认源码树内 output/）")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${EASYTSHARK_OUTPUT_DIR}")
 
 file(COPY ${CMAKE_SOURCE_DIR}/resources DESTINATION ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 
@@ -41,9 +56,12 @@ set(LIB_SOURCES
     src/LiveCapture.cpp
     src/FlowMonitor.cpp
     src/PdmlToJsonConverter.cpp
-    src/xdb_bench.cc
+    src/NativePacketParser.cpp
+    src/NativeAnalyzer.cpp
+    src/NativeCapture.cpp
     src/xdb_search.cc
     src/processUtil.cpp
+    src/web/WebServer.cpp
 )
 
 # I/O 多路复用 + 非阻塞管道读取：按平台二选一，接口一致，业务代码平台无关。
@@ -91,6 +109,21 @@ elseif(WIN32)
     target_link_libraries(tshark_lib ws2_32)
 else()
     target_link_libraries(tshark_lib pthread dl sqlite3)
+endif()
+
+# 自研引擎的实时抓包依赖 libpcap（BSD 许可）：macOS 系统自带；Linux 需 libpcap-dev；
+# Windows 需 Npcap SDK。找不到时编译仍通过——NativeCapture 退化为“无法抓包”，
+# 离线解析（NativeAnalyzer）不依赖 libpcap，始终可用。
+find_library(PCAP_LIBRARY NAMES pcap)
+find_path(PCAP_INCLUDE_DIR NAMES pcap.h)
+if(PCAP_LIBRARY AND PCAP_INCLUDE_DIR)
+    target_compile_definitions(tshark_lib PUBLIC EASYTSHARK_HAVE_LIBPCAP=1)
+    target_include_directories(tshark_lib PUBLIC ${PCAP_INCLUDE_DIR})
+    # 注意：tshark_lib 已用 plain signature 链接过系统库，这里保持 plain（不写 PUBLIC 关键字）
+    target_link_libraries(tshark_lib ${PCAP_LIBRARY})
+    message(STATUS "libpcap 已找到：${PCAP_LIBRARY}（自研实时抓包可用）")
+else()
+    message(STATUS "libpcap 未找到：实时抓包仅 tshark 路径可用；离线解析不受影响")
 endif()
 
 # 主可执行文件

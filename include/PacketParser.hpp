@@ -5,8 +5,7 @@
 
 #include "tsharkDataType.hpp"
 
-// 纯粹的行解析：把一行 tshark "-T fields" 制表符分隔输出解析成 Packet。
-// 不依赖 tshark 进程、不做任何 IO、不查询 IP 地理位置——因此可脱离 tshark 独立单测。
+// 纯行解析：把一行 tshark "-T fields" 制表符分隔输出解析成 Packet；无 IO、可独立单测。
 // 字段顺序与 TsharkCommand::tsharkFieldArgs() 严格对应（0..15），改动需两处同步。
 namespace PacketParser
 {

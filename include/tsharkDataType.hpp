@@ -25,14 +25,11 @@ struct Packet
     std::string info;
     // 该报文在 pcap 文件中的字节偏移。累计值可超过 4GB，用 64 位避免大文件溢出。
     uint64_t file_offset = 0;
-    // 传输层协议（"TCP"/"UDP"/""）：仅内存态、不入库，由 parseLine 依据
-    // tcp/udp 端口字段哪个非空推断，供 GUI 的会话视图区分 TCP / UDP 会话。
+    // 传输层协议（"TCP"/"UDP"/""）：仅内存态、不入库，供 GUI 会话视图区分 TCP/UDP。
     std::string transport;
 };
 
-// 协议分层树的一个节点：把 tshark PDML 的 proto / field 逐层解析成
-// label（显示名）+ value（取值）+ children（子字段），供详情面板递归展开。
-// 只承载展示用文本，不做协议语义解释。
+// 协议分层树节点：承载展示用文本（label/value/children），供详情面板递归展开。
 struct DetailNode
 {
     std::string             label; // 显示名（PDML showname，回退到 name）

@@ -15,12 +15,10 @@
 class ProcessUtil {
 public:
 #if defined(_WIN32)
-    // Windows：子进程由内核对象 HANDLE 标识（等待/终止都需要它）。头文件里用
-    // void* 承载，避免把重型的 <windows.h> 传染给所有包含者；实现里再转回 HANDLE。
+    // Windows：子进程用 HANDLE 标识。头文件用 void* 承载，避免把 <windows.h> 传染给包含者。
     using ProcHandle = void*;
 #else
-    // POSIX：子进程由 pid_t 标识。此别名令 ProcHandle 在 POSIX 上等价于 pid_t，
-    // 故现有以 pid_t 传参/存储的调用方无需改动即可继续编译。
+    // POSIX：子进程用 pid_t 标识。
     using ProcHandle = pid_t;
 #endif
 
@@ -61,7 +59,7 @@ public:
      * @return FILE* 管道文件指针，失败返回 nullptr
      */
     static FILE* PopenEx(const std::vector<std::string>& argv, ProcHandle* pid,
-                         const char* type = "r");
+                         const char* type = "r", bool mergeStderr = false);
 
     /**
      * @brief 终止指定子进程并回收
@@ -73,9 +71,8 @@ public:
     /**
      * @brief 请求子进程终止，但**不回收**（不 waitpid / 不 CloseHandle）
      * @param pid 子进程句柄
-     * @note 供“发信号令其收尾 + 由配套 PcloseEx 单点回收”的场景（如 LiveCapture 停止）使用，
-     *       避免与 PcloseEx 争抢回收造成 POSIX 双重 waitpid 或 Windows 双重 CloseHandle。
-     *       POSIX 发 SIGTERM；Windows 用 TerminateProcess（不关句柄）。
+     * @note 供“发信号收尾 + 由配套 PcloseEx 单点回收”的场景使用，避免与 PcloseEx 争抢回收
+     *       造成双重 waitpid / CloseHandle。POSIX 发 SIGTERM；Windows 用 TerminateProcess。
      */
     static bool Signal(ProcHandle pid);
 

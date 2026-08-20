@@ -1,6 +1,7 @@
 #include <chrono>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <string>
 #include <thread>
@@ -14,8 +15,7 @@
 #include <windows.h> // SetConsoleOutputCP / SetConsoleCP
 #endif
 
-// main 只负责命令行交互与装配：读取用户输入、调用 AnalysisSession 门面，
-// 所有抓包 / 解析 / 入库 / 查询逻辑都在门面内部，UI（此处是 CLI）不碰实现细节。
+// main 只负责命令行交互与装配：读用户输入、调用 AnalysisSession 门面，不碰实现细节。
 
 namespace
 {
@@ -88,11 +88,13 @@ void runQueryLoop(AnalysisSession& session)
 int main(int argc, char* argv[])
 {
 #if defined(_WIN32)
-    // 源码里的中文提示均为 UTF-8 字节；Windows 控制台默认按本地代码页(GBK/936)解码，
-    // 会把 UTF-8 中文显示成乱码。把控制台输入/输出代码页都切到 UTF-8 即可正常显示。
+    // Windows 控制台默认按本地代码页(GBK)解码会把 UTF-8 中文显示成乱码，切到 UTF-8 修正。
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
+
+    // logs/ 只保留最近 10 个日志文件，防止无限累积。
+    CommonUtil::pruneLogFiles("logs", 10);
 
     std::string ts               = CommonUtil::get_timestamp();
     std::string capture_log_name = "logs/capture_" + ts + ".log";
@@ -103,24 +105,34 @@ int main(int argc, char* argv[])
     std::string     tsharkPath = TsharkCommand::resolveTsharkPath();
     AnalysisSession session(tsharkPath, "data");
 
-    // 未检测到 tshark 时给出友好引导（本工具依赖 Wireshark 的 tshark 做抓包/解析）。
-    // 这里只提示不退出：仍进入菜单，真正用到 tshark 的操作会各自报错。
+    // 未检测到 tshark 时告知降级到内置解析引擎，安装 Wireshark 可获得完整协议支持。
     if (!TsharkCommand::tsharkAvailable(tsharkPath))
     {
-        std::cerr << "警告：未检测到 tshark（已尝试路径: " << tsharkPath << "）。\n"
-                  << "本工具依赖 Wireshark 提供的 tshark。请先安装 Wireshark："
+        std::cerr << "提示：未检测到 tshark（已尝试路径: " << tsharkPath << "），"
+                  << "将使用内置解析引擎（覆盖常用协议）。\n"
+                  << "安装 Wireshark 可解锁完整协议详情："
                   << TsharkCommand::wiresharkDownloadUrl() << "\n"
-                  << "若已安装在非默认位置，可设置环境变量 EASYTSHARK_TSHARK 指向 tshark"
-#if defined(_WIN32)
-                     ".exe"
-#endif
-                  << " 的完整路径。\n"
+                  << "也可设置环境变量 EASYTSHARK_TSHARK 指定 tshark 路径。\n"
                   << std::endl;
     }
 
     int mode = 0;
-    std::cout << "请选择模式：\n1. 实时抓包\n2. 离线分析\n请输入选择 (1或2): ";
-    std::cin >> mode;
+    // 输入校验：非数字 / 非法选项时循环重试（避免 cin 失败流死循环与误退出）
+    while (true)
+    {
+        std::cout << "请选择模式：\n1. 实时抓包\n2. 离线分析\n请输入选择 (1或2): ";
+        std::cin >> mode;
+        if (std::cin.fail())
+        {
+            std::cin.clear();
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            std::cout << "输入无效，请输入数字 1 或 2。" << std::endl;
+            continue;
+        }
+        if (mode == 1 || mode == 2)
+            break;
+        std::cout << "无效的选择，请输入 1 或 2。" << std::endl;
+    }
 
     if (mode == 1)
     {
@@ -149,16 +161,32 @@ int main(int argc, char* argv[])
         std::cin >> adapterName;
 
         int captureSeconds = 0;
-        std::cout << "请输入抓包时间(秒): ";
-        std::cin >> captureSeconds;
+        // 抓包时长：1~86400 秒（1 天）内合法；非数字 / 越界时循环重试
+        while (true)
+        {
+            std::cout << "请输入抓包时间(秒，1~86400): ";
+            std::cin >> captureSeconds;
+            if (std::cin.fail())
+            {
+                std::cin.clear();
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                std::cout << "输入无效，请输入数字。" << std::endl;
+                continue;
+            }
+            if (captureSeconds >= 1 && captureSeconds <= 86400)
+                break;
+            std::cout << "时长需在 1~86400 秒之间。" << std::endl;
+        }
 
         std::cout << "开始抓包，持续 " << captureSeconds << " 秒..." << std::endl;
-        if (!session.startLiveCapture(adapterName))
+        // -a duration:N 让 tshark 到点自行收尾，轮询等其结束，stopLiveCapture 只负责解析入库。
+        if (!session.startLiveCapture(adapterName, nullptr, captureSeconds))
         {
             std::cerr << "启动抓包失败" << std::endl;
             return 1;
         }
-        std::this_thread::sleep_for(std::chrono::seconds(captureSeconds));
+        while (session.isCapturing())
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
         if (!session.stopLiveCapture())
         {

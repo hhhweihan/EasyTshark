@@ -1,14 +1,7 @@
-// EasyTshark 原生前端
-//
-// 用 Dear ImGui（即时模式 GUI）+ GLFW/OpenGL3 后端把核心能力可视化。UI 只通过
-// AnalysisSession 门面访问数据，不直接触碰 tshark / 解析 / 数据库细节——这就是
-// 项目里的“核心库 ↔ UI 层”边界（同进程，不是网络前后端分离）。
-//
-// 布局采用 Tab 风格（顶部工具栏 + 过滤栏 + 报文/会话/统计/查询 分页 + 底部状态栏），
-// 在此之上补齐各分页的功能与显示。
-//
-// 线程约定：耗时操作（载入 pcap、停止抓包后解析入库）放到 std::async 的后台任务里跑，
-// UI 线程每帧只轮询任务是否完成，从不阻塞在解析上；完成后在 UI 线程刷新报文快照。
+// EasyTshark 原生前端（Dear ImGui + GLFW/OpenGL3）。
+// UI 只通过 AnalysisSession 门面访问数据，不直接触碰 tshark / 解析 / 数据库细节。
+// 线程约定：耗时操作（载入 pcap、停止抓包后解析入库）放到 std::async 后台任务里跑，
+// UI 线程每帧只轮询完成状态，从不阻塞在解析上。
 
 #include <algorithm>
 #include <atomic>
@@ -16,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
+#include <fstream>
 #include <functional>
 #include <future>
 #include <map>
@@ -39,6 +34,26 @@ namespace
 {
 
 using PacketPtr = std::shared_ptr<Packet>;
+
+// 文件是否已存在（保存前用来决定是否弹「覆盖确认」）。
+bool fileExists(const std::string& path)
+{
+    if (path.empty())
+        return false;
+    std::ifstream f(path.c_str());
+    return f.good();
+}
+
+// 文件名缺扩展名时补 .pcap。只看最后一段有无 '.'，避免把目录名里的点误判为扩展名。
+std::string withPcapSuffix(const std::string& path)
+{
+    if (path.empty())
+        return path;
+    size_t slash = path.find_last_of("/\\");
+    size_t dot   = path.find_last_of('.');
+    bool   hasExt = (dot != std::string::npos) && (slash == std::string::npos || dot > slash);
+    return hasExt ? path : path + ".pcap";
+}
 
 // ---- 会话 / 统计聚合的数据结构 ----
 
@@ -89,17 +104,21 @@ struct AppState
     // 离线载入 / 保存
     char pcapPathInput[512] = {0};
     char savePathInput[512] = {0};
+    // 保存时目标文件已存在：暂存补全后的路径，弹「覆盖确认」再决定是否写入。
+    std::string pendingSaveDest;
 
     // 抓包
     std::vector<AdapterInfo> adapters;
     char                     adapterName[128] = {0};
 
-    // 实时抓包：抓包线程通过回调把包投进 liveIncoming（加锁），UI 线程每帧取出
-    // 追加到 packets，实现边抓边显示。liveCapturing 标记当前处于实时模式。
-    std::mutex             liveMutex;
-    std::vector<PacketPtr> liveIncoming;
-    bool                   liveCapturing = false;
-    bool                   autoScroll    = true;
+    // 实时抓包：抓包线程把包投进 liveIncoming（加锁），UI 线程每帧取出追加到 packets。
+    // kMaxLive 给缓冲与展示列表设上限，超限丢弃最旧包（停止后重解析得完整结果），防内存无限增长。
+    static const size_t kMaxLiveBuffered   = 20000;
+    static const size_t kMaxLiveDisplayed  = 500000;
+    std::mutex          liveMutex;
+    std::deque<PacketPtr> liveIncoming;
+    bool                  liveCapturing = false;
+    bool                  autoScroll    = true;
 
     // 会话 / 统计的缓存：仅当报文数量变化时重建，避免每帧 O(N) 聚合。
     size_t                   analyticsBuiltCount = (size_t)-1;
@@ -125,21 +144,17 @@ struct AppState
     std::string           status = "就绪";
     std::function<void()> onDone; // 任务成功后在 UI 线程执行的收尾（刷新快照等）
 
-    // 显示过滤的后台结果暂存：后台线程写 filterScratch，完成后在 UI 线程 swap 进
-    // displayFiltered，避免后台改写 displayFiltered 与 UI 绘制读它竞态。
+    // 显示过滤的后台结果暂存：后台线程写 filterScratch，完成后 UI 线程 swap 进 displayFiltered，避免竞态。
     std::vector<PacketPtr> filterScratch;
 
-    // 选中报文协议详情的后台加载：getDetailTree 要新起一个 tshark 单包 PDML 解析
-    // （约百毫秒），放后台避免每次点选卡 UI 帧。detailResult 由后台线程写、就绪后
-    // pollDetail 在 UI 线程取用。detailDraining 暂存被新点选取代、尚未完成的旧任务，
-    // 避免在点击处析构 std::async future 时阻塞 UI（其析构会 join 后台线程）。
+    // 选中报文协议详情的后台加载（getDetailTree 约百毫秒，放后台免卡帧）。
+    // detailDraining 暂存被新点选取代、尚未完成的旧任务：析构 future 会 join 阻塞 UI，故不在点击处析构。
     std::future<bool>              detailPending;
     std::shared_ptr<DetailNode>    detailResult;
     uint32_t                       detailFrame = 0;
     std::vector<std::future<bool>> detailDraining;
 
-    // tshark 可执行文件路径输入框：允许用户在 GUI 里手动指定 tshark(.exe)，无需重编译。
-    // 构造时用会话当前（已自动解析）的路径回填，方便查看/修改。
+    // tshark 路径输入框：允许在 GUI 里手动指定，无需重编译。构造时用会话当前路径回填。
     char tsharkPathInput[512] = {0};
 
     explicit AppState(AnalysisSession& s) : session(s)
@@ -207,9 +222,8 @@ ImVec4 protocolColor(const std::string& proto)
     return ImVec4(0.80f, 0.80f, 0.80f, 1.0f);
 }
 
-// 把 frame.time_epoch（自 1970 起的秒，带小数）格式化成人类可读的本地时间
-// "MM-DD HH:MM:SS.mmm"。原始时间戳信息量大但不直观，单独给一列易读时间。
-// localtime 的静态缓冲不可重入，按平台用 localtime_s / localtime_r 写入栈上 tm。
+// frame.time_epoch 格式化成本地时间 "MM-DD HH:MM:SS.mmm"。
+// localtime 静态缓冲不可重入，按平台用 localtime_s / localtime_r 写入栈上 tm。
 std::string formatEpoch(double epoch)
 {
     if (epoch <= 0.0)
@@ -276,8 +290,7 @@ void pollAsync(AppState& s)
     }
     catch (const std::exception& e)
     {
-        // 后台任务（载入 pcap、抓包、显示过滤等）内部启动 tshark 失败时会抛异常，
-        // future::get 会在 UI 线程重新抛出。这里兜住，转成失败状态，避免闪退。
+        // 后台任务抛出的异常会由 future::get 在 UI 线程重新抛出，这里兜住转成失败状态，避免闪退。
         ok       = false;
         s.busy   = false;
         s.status = std::string("失败：") + e.what();
@@ -321,12 +334,10 @@ void loadSelected(AppState& s)
     s.detailLoaded = false;
     if (!s.selectedPkt)
         return;
-    // 实时抓包途中离线分析尚未跑：随机读文件与 currentFilePath 都还没就绪，
-    // 此时取 hex/详情必然失败（且会刷 ERR 日志）。等“停止并分析”后再取。
+    // 实时抓包途中随机读文件尚未就绪，取 hex/详情必然失败，等“停止并分析”后再取。
     if (s.liveCapturing)
         return;
-    // 后台正在解析/入库时，analyzer_ 的文件与随机读取器正被改写，此刻取包会与之竞态；
-    // 等任务完成（refreshPackets 后）再取。
+    // 后台解析/入库时 analyzer_ 的文件与随机读取器正被改写，此刻取包会竞态，等任务完成后再取。
     if (s.busy)
         return;
 
@@ -335,8 +346,7 @@ void loadSelected(AppState& s)
     if (s.session.getHex(frame, s.hex))
         s.hexFrame = frame;
 
-    // 协议详情放后台：若上一次点选的任务还没跑完，先把它移进 draining 暂存，
-    // 不在点击处析构其 future（那会 join 后台线程、阻塞 UI）；pollDetail 里就绪后回收。
+    // 协议详情放后台：上次点选未完成的任务移进 draining，不在点击处析构其 future（会 join 阻塞 UI）。
     if (s.detailPending.valid())
         s.detailDraining.push_back(std::move(s.detailPending));
     s.detailResult                   = std::make_shared<DetailNode>();
@@ -396,12 +406,12 @@ void pollDetail(AppState& s)
 // 从门面刷新报文快照（在 UI 线程调用）
 void refreshPackets(AppState& s)
 {
-    s.packets     = s.session.packetsSnapshot();
+    s.packets     = *s.session.packetsSnapshot();
     s.selectedPkt = nullptr;
     s.hex.clear();
     s.detail       = DetailNode();
     s.detailLoaded = false;
-    // 可能有针对旧文件的详情任务在跑：移进 draining 等其自然结束回收，别在此析构阻塞。
+    // 针对旧文件的详情任务移进 draining 等其自然结束回收，别在此析构阻塞。
     if (s.detailPending.valid())
         s.detailDraining.push_back(std::move(s.detailPending));
     s.detailResult.reset();
@@ -417,7 +427,7 @@ void refreshPackets(AppState& s)
 // 每帧把抓包线程投递的实时包取出，追加到列表（UI 线程调用，短暂持锁只做 swap）。
 void drainLive(AppState& s)
 {
-    std::vector<PacketPtr> batch;
+    std::deque<PacketPtr> batch;
     {
         std::lock_guard<std::mutex> lk(s.liveMutex);
         if (s.liveIncoming.empty())
@@ -427,6 +437,13 @@ void drainLive(AppState& s)
     for (const PacketPtr& p : batch)
         s.totalBytes += p->len;
     s.packets.insert(s.packets.end(), batch.begin(), batch.end());
+    // 实时展示列表上限：超限丢弃最旧的一半（保留最新报文），并提示完整结果可在停止后查看。
+    if (s.packets.size() > AppState::kMaxLiveDisplayed)
+    {
+        size_t drop = s.packets.size() - AppState::kMaxLiveDisplayed;
+        s.packets.erase(s.packets.begin(), s.packets.begin() + drop);
+        s.status = "实时列表超上限，已丢弃最早报文（停止后可查看完整结果）";
+    }
     s.viewDirty = true;
 }
 
@@ -573,19 +590,51 @@ void drawToolbar(AppState& s)
     ImGui::TextUnformatted("  |  保存:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(240);
-    ImGui::InputTextWithHint("##savepath", "另存为 .pcap 路径", s.savePathInput,
+    ImGui::InputTextWithHint("##savepath", "另存为 .pcap 路径（缺目录会自动创建）", s.savePathInput,
                              sizeof(s.savePathInput));
     ImGui::SameLine();
     ImGui::BeginDisabled(s.busy || s.session.pcapPath().empty());
     if (ImGui::Button("保存"))
     {
-        std::string dest = s.savePathInput;
-        s.status = s.session.savePcapAs(dest) ? ("已保存: " + dest) : "保存失败";
+        std::string dest = withPcapSuffix(s.savePathInput); // 缺后缀补 .pcap
+        if (dest.empty())
+        {
+            s.status = "请先填写保存路径";
+        }
+        else if (fileExists(dest) && dest != s.session.pcapPath())
+        {
+            // 目标已存在（且不是当前源文件本身）：先弹确认，避免误覆盖。
+            s.pendingSaveDest = dest;
+            ImGui::OpenPopup("确认覆盖");
+        }
+        else
+        {
+            s.status = s.session.savePcapAs(dest) ? ("已保存: " + dest) : "保存失败";
+        }
     }
     ImGui::EndDisabled();
 
-    // tshark 路径：显示当前解析到的路径，允许手动改指到 tshark(.exe) 后应用（无需重编译）。
-    // 未检测到时红字提示并给出下载地址，引导用户安装 Wireshark。
+    // 覆盖确认弹窗：目标文件已存在时由「保存」按钮触发。
+    if (ImGui::BeginPopupModal("确认覆盖", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::Text("文件已存在：\n%s\n\n确定覆盖？", s.pendingSaveDest.c_str());
+        ImGui::Separator();
+        if (ImGui::Button("覆盖"))
+        {
+            s.status = s.session.savePcapAs(s.pendingSaveDest) ? ("已保存: " + s.pendingSaveDest)
+                                                               : "保存失败";
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("取消"))
+        {
+            s.status = "已取消保存";
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    // tshark 路径：显示当前路径，允许手动改指后应用；未检测到时红字提示并给出下载地址。
     ImGui::TextUnformatted("tshark 路径:");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(360);
@@ -615,8 +664,7 @@ void drawToolbar(AppState& s)
     ImGui::SameLine();
     if (ImGui::Button("刷新网卡"))
     {
-        // 枚举网卡会启动 tshark 子进程；若 tshark 未安装/不在默认路径，listAdapters 会抛
-        // std::runtime_error。这里必须捕获——否则异常冲出 ImGui 帧循环导致整个窗口闪退。
+        // listAdapters 会启动 tshark，失败时抛异常；必须捕获，否则异常冲出 ImGui 帧循环致窗口闪退。
         try
         {
             s.adapters = s.session.listAdapters();
@@ -668,6 +716,8 @@ void drawToolbar(AppState& s)
             {
                 std::lock_guard<std::mutex> lk(sp->liveMutex);
                 sp->liveIncoming.push_back(p);
+                if (sp->liveIncoming.size() > AppState::kMaxLiveBuffered)
+                    sp->liveIncoming.pop_front(); // 抓包线程丢弃最旧，O(1)
             });
         if (ok)
         {
@@ -703,8 +753,7 @@ void drawFilterBar(AppState& s)
     bool find = ImGui::Button("查找");
     if ((find || enter) && s.filterExpr[0])
     {
-        // 显示过滤要跑一次 tshark（-Y），放后台，避免在 UI 线程同步等待卡帧。
-        // 后台写 filterScratch，成功后在 onDone（UI 线程）swap 进 displayFiltered。
+        // 显示过滤要跑一次 tshark（-Y），放后台免卡帧；成功后在 onDone 里 swap 进 displayFiltered。
         std::string expr = s.filterExpr;
         AppState*   sp   = &s;
         beginAsync(s,
@@ -822,9 +871,8 @@ void drawPacketTable(AppState& s)
         ImGui::Text("共 %zu 条%s", s.view.size(), s.displayFilterOn ? "（已过滤）" : "");
     }
 
-    // ScrollX：窗口偏窄时列会被挤压到显示不全（IP/归属地被截成“...”）。开启横向滚动后
-    // 各列保持固定宽度、总宽超出可视区时可左右拖动查看完整内容。
-    // 注意：ScrollX 下 WidthStretch 列不再自动填充，故下面把原先拉伸的列改为固定宽度。
+    // ScrollX：窗口偏窄时开启横向滚动，各列保持固定宽度可左右拖动。
+    // 注意：ScrollX 下 WidthStretch 列不再自动填充，故下面各列改为固定宽度。
     const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX |
                                   ImGuiTableFlags_Resizable;
@@ -940,8 +988,7 @@ void drawDetail(AppState& s)
 
     // 协议分层树（占上半区）
     ImGui::TextUnformatted("协议分层:");
-    // 加 HorizontalScrollbar：深层嵌套字段展开后单行常超出可视宽度，
-    // 无横向滚动只能被裁剪；有了它可左右拖动查看完整内容。
+    // 加 HorizontalScrollbar：深层嵌套字段展开后单行常超出可视宽度，可左右拖动查看。
     ImGui::BeginChild("prototree", ImVec2(0, ImGui::GetContentRegionAvail().y * 0.5f), true,
                       ImGuiWindowFlags_HorizontalScrollbar);
     if (s.detailLoaded && !s.detail.children.empty())

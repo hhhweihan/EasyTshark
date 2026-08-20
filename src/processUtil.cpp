@@ -3,16 +3,8 @@
 #if defined(_WIN32)
 // ============================================================================
 // Windows 实现：CreateProcess + 匿名管道（CreatePipe）
-//
-// 与 POSIX 的 fork+execvp 对应关系：
-//   fork+execvp        → CreateProcessA（一步创建并加载新程序，无 fork 语义）
-//   pipe()             → CreatePipe（匿名管道，用于父子间重定向 stdout/stdin）
-//   dup2 到 STDOUT     → STARTUPINFO.hStdOutput/hStdInput + STARTF_USESTDHANDLES
-//   waitpid            → WaitForSingleObject + GetExitCodeProcess
-//   kill(SIGTERM)      → TerminateProcess（注意：等价 SIGKILL，非优雅收尾，见下）
-//
-// 句柄继承：管道给子进程用的那一端必须可继承（SECURITY_ATTRIBUTES.bInheritHandle），
-// 父进程自留的那一端用 SetHandleInformation 去掉继承标志，否则子进程退出后父端收不到 EOF。
+// 句柄继承：给子进程的管道端须可继承，父进程自留端用 SetHandleInformation 去掉继承标志，
+// 否则子进程退出后父端收不到 EOF。TerminateProcess 等价 SIGKILL，非优雅收尾。
 // ============================================================================
 
 #include <cstdint>
@@ -23,8 +15,7 @@
 
 namespace
 {
-// 按 Windows CommandLineToArgvW 的规则对单个参数加引号转义：
-// 仅在含空白或引号时加外层双引号；反斜杠只有在紧邻引号时才需成对转义。
+// 按 CommandLineToArgvW 规则给参数加引号转义：含空白/引号才加外层引号，反斜杠仅紧邻引号时成对转义。
 std::string quoteArg(const std::string& arg)
 {
     if (!arg.empty() && arg.find_first_of(" \t\n\v\"") == std::string::npos)
@@ -77,9 +68,9 @@ std::string argvToCommandLine(const std::vector<std::string>& argv)
     return cmd;
 }
 
-// 创建子进程并把其 stdout（读模式）或 stdin（写模式）接到匿名管道，
-// 父端封装成 FILE* 返回。pidOut 收子进程 HANDLE，供后续等待/终止。
-FILE* spawnWithPipe(const std::string& cmdline, ProcessUtil::ProcHandle* pidOut, bool readMode)
+// 创建子进程并把其 stdout(读)/stdin(写) 接到匿名管道，父端封装成 FILE* 返回；pidOut 收子进程 HANDLE。
+FILE* spawnWithPipe(const std::string& cmdline, ProcessUtil::ProcHandle* pidOut, bool readMode,
+                          bool mergeStderr)
 {
     SECURITY_ATTRIBUTES sa;
     sa.nLength              = sizeof(sa);
@@ -104,7 +95,8 @@ FILE* spawnWithPipe(const std::string& cmdline, ProcessUtil::ProcHandle* pidOut,
     if (readMode)
     {
         si.hStdOutput = childEnd; // 子进程 stdout → 管道写端
-        si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+        // mergeStderr：stderr 一并写入管道（如 tshark 的 -Y 错误信息），否则透传父进程
+        si.hStdError  = mergeStderr ? childEnd : GetStdHandle(STD_ERROR_HANDLE);
         si.hStdInput  = GetStdHandle(STD_INPUT_HANDLE);
     }
     else
@@ -121,10 +113,8 @@ FILE* spawnWithPipe(const std::string& cmdline, ProcessUtil::ProcHandle* pidOut,
     std::vector<char> mutableCmd(cmdline.begin(), cmdline.end());
     mutableCmd.push_back('\0');
 
-    // CREATE_NEW_PROCESS_GROUP：让子进程自成进程组，为将来用 GenerateConsoleCtrlEvent
-    // 做优雅停止预留可能（当前 Kill 仍用 TerminateProcess）。
-    // CREATE_NO_WINDOW：父进程是 GUI 时，控制台程序 tshark 会弹出黑色控制台窗口；
-    // 加此标志令其不创建控制台。我们只经匿名管道读它的 stdout，功能不受影响。
+    // CREATE_NEW_PROCESS_GROUP：为将来 GenerateConsoleCtrlEvent 优雅停止预留。
+    // CREATE_NO_WINDOW：GUI 父进程下不为控制台程序 tshark 弹出黑框（只经管道读 stdout，不受影响）。
     BOOL ok = CreateProcessA(nullptr, mutableCmd.data(), nullptr, nullptr,
                              TRUE, // 继承句柄（含上面可继承的 childEnd）
                              CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, nullptr, nullptr, &si,
@@ -143,8 +133,7 @@ FILE* spawnWithPipe(const std::string& cmdline, ProcessUtil::ProcHandle* pidOut,
     if (pidOut)
         *pidOut = pi.hProcess; // 交出进程 HANDLE（由 PcloseEx/Kill 负责 CloseHandle）
 
-    // 把父端 HANDLE 交给 CRT：_open_osfhandle 成功后该 HANDLE 归 fd 所有，
-    // 关闭 FILE*/fd 即关闭底层管道句柄，不可再单独 CloseHandle(parentEnd)。
+    // 父端 HANDLE 交给 CRT：_open_osfhandle 成功后归 fd 所有，关闭 fd 即关句柄，不可再 CloseHandle。
     int osFlags = readMode ? _O_RDONLY : _O_WRONLY;
     int fd      = _open_osfhandle(reinterpret_cast<intptr_t>(parentEnd), osFlags);
     if (fd == -1)
@@ -217,11 +206,12 @@ FILE* ProcessUtil::PopenEx(const char* command, ProcHandle* pid, const char* typ
     return spawnWithPipe(shellCmd, pid, type[0] == 'r');
 }
 
-FILE* ProcessUtil::PopenEx(const std::vector<std::string>& argv, ProcHandle* pid, const char* type)
+FILE* ProcessUtil::PopenEx(const std::vector<std::string>& argv, ProcHandle* pid,
+                            const char* type, bool mergeStderr)
 {
     if (argv.empty())
         return nullptr;
-    return spawnWithPipe(argvToCommandLine(argv), pid, type[0] == 'r');
+    return spawnWithPipe(argvToCommandLine(argv), pid, type[0] == 'r', mergeStderr);
 }
 
 bool ProcessUtil::Kill(ProcHandle pid)
@@ -231,8 +221,7 @@ bool ProcessUtil::Kill(ProcHandle pid)
 
     HANDLE hProc = static_cast<HANDLE>(pid);
     // 注意：TerminateProcess 等价 SIGKILL，tshark 不会 flush -w 文件即被杀。
-    // 若将来需要“优雅收尾”，可对 CREATE_NEW_PROCESS_GROUP 的子进程发
-    // GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, dwProcessId)，此处从简。
+    // 若需优雅收尾可对进程组发 GenerateConsoleCtrlEvent，此处从简。
     BOOL terminated = TerminateProcess(hProc, 1);
     WaitForSingleObject(hProc, INFINITE); // 回收，避免句柄悬挂
     CloseHandle(hProc);
@@ -243,8 +232,7 @@ bool ProcessUtil::Signal(ProcHandle pid)
 {
     if (!ValidProc(pid))
         return false;
-    // 只请求终止，不 WaitForSingleObject / 不 CloseHandle：回收留给配套的 PcloseEx。
-    // 同 Kill 的局限：TerminateProcess 无法让 tshark flush -w 文件（Windows 无 SIGTERM 语义）。
+    // 只请求终止，回收留给配套的 PcloseEx；同 Kill：无法让 tshark flush -w 文件。
     return TerminateProcess(static_cast<HANDLE>(pid), 1) != FALSE;
 }
 
@@ -294,9 +282,8 @@ bool ProcessUtil::Exec(const std::vector<std::string>& argv)
     if (argv.empty())
         return false;
 
-    // 在 fork 之前构建 argv 数组：多线程程序里 fork 之后、exec 之前只能调用
-    // async-signal-safe 函数，若此刻别的线程正持有 malloc 锁，子进程再分配就会死锁。
-    // cargv 里的指针指向 argv 各字符串的缓冲，父进程持续存活、子进程经 COW 共享，均有效。
+    // fork 前构建 argv：fork 后 exec 前只能调 async-signal-safe 函数，此刻别的线程持 malloc 锁会死锁。
+    // cargv 指针指向 argv 缓冲，父进程存活、子进程 COW 共享，均有效。
     std::vector<char*> cargv;
     cargv.reserve(argv.size() + 1);
     for (const auto& arg : argv)
@@ -320,11 +307,8 @@ bool ProcessUtil::Exec(const std::vector<std::string>& argv)
     return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
-// @warning 该 const char* 版经由 /bin/sh -c 执行命令，存在两点代价：
-//   1) 多派生一层 shell 进程（fork+exec(sh)，sh 再 fork+exec 目标程序）；
-//   2) 命令中的 ; | $() ` 等元字符会被 shell 解释，拼接用户输入会造成注入。
-// 因此仅供测试等可信、固定命令场景使用。业务热路径（抓包/解析/监控）一律用下方
-// 接收 argv 向量的重载，走 execvp 直接替换地址空间，既省一层进程也无注入面。
+// @warning 该 const char* 版经 /bin/sh -c 执行：多一层 shell 进程，且 ; | $() ` 等元字符会被
+// shell 解释，拼接用户输入会注入。仅供测试等可信、固定命令场景；业务热路径一律用下方 argv 重载。
 FILE* ProcessUtil::PopenEx(const char* command, ProcHandle* pid, const char* type)
 {
     int   pipefd[2];
@@ -375,7 +359,8 @@ FILE* ProcessUtil::PopenEx(const char* command, ProcHandle* pid, const char* typ
     }
 }
 
-FILE* ProcessUtil::PopenEx(const std::vector<std::string>& argv, ProcHandle* pid, const char* type)
+FILE* ProcessUtil::PopenEx(const std::vector<std::string>& argv, ProcHandle* pid,
+                            const char* type, bool mergeStderr)
 {
     if (argv.empty())
         return nullptr;
@@ -391,10 +376,9 @@ FILE* ProcessUtil::PopenEx(const std::vector<std::string>& argv, ProcHandle* pid
     if (pipe(pipefd) < 0)
         return nullptr;
 
-    // 两端立即置 FD_CLOEXEC：多线程下同时有多个网卡管道时，若不设置，后 fork 的子进程
-    // 会继承前面管道的描述符，导致前一个管道在其对应 tshark 退出后仍收不到 EOF。子进程
-    // dup2 到 stdio 的那一端由 dup2 清除 CLOEXEC 而在 exec 后存活，原始描述符则于 exec 时
-    // 自动关闭。pipe()→fcntl 之间仍有极窄竞态窗口（macOS 无 pipe2 无法原子设置），可接受。
+    // 两端立即置 FD_CLOEXEC：多网卡管道并发时若不设，后 fork 的子进程会继承前面管道的 fd，
+    // 导致前一个管道在其 tshark 退出后收不到 EOF。dup2 到 stdio 的端会清除 CLOEXEC 而存活。
+    // pipe()→fcntl 间有极窄竞态（macOS 无 pipe2 无法原子设置），可接受。
     fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
     fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
 
@@ -412,6 +396,8 @@ FILE* ProcessUtil::PopenEx(const std::vector<std::string>& argv, ProcHandle* pid
         {
             close(pipefd[0]);
             dup2(pipefd[1], STDOUT_FILENO);
+            if (mergeStderr)
+                dup2(pipefd[1], STDERR_FILENO); // stderr 合并进管道（错误信息可读）
         }
         else
         {
@@ -445,8 +431,7 @@ bool ProcessUtil::Kill(ProcHandle pid)
     if (pid <= 0)
         return false;
 
-    // 即便进程可能已自行退出（kill 返回 -1，如 EOF 后的僵尸），仍要 waitpid 回收其残留，
-    // 否则会漏掉一个僵尸进程。故不因 kill 失败提前返回。
+    // 即便进程已自行退出（kill 返回 -1），仍要 waitpid 回收残留避免僵尸，故不因 kill 失败提前返回。
     bool signaled = (kill(pid, SIGTERM) == 0);
 
     int  status;
