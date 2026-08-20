@@ -50,10 +50,11 @@ bool isPcapNg(const unsigned char* p)
 }
 
 // 只保留能正确解析的链路类型；未知类型按 Ethernet 兜底。
-// 0=NULL/Loopback，1=Ethernet，113=Linux SLL，276=Linux SLL2。
+// 0=NULL/Loopback，1=Ethernet，113=Linux SLL，276=Linux SLL2，
+// 227=CAN SocketCAN，228=CAN，229=CAN FD（汽车诊断/总线抓包）。
 uint32_t normalizeLinkType(uint32_t lt)
 {
-    if (lt == 0 || lt == 1 || lt == 113 || lt == 276)
+    if (lt == 0 || lt == 1 || lt == 113 || lt == 276 || lt == 227 || lt == 228 || lt == 229)
         return lt;
     return 1;
 }
@@ -103,11 +104,24 @@ void parseIdb(const unsigned char* blk, uint32_t total, uint32_t& linkType, doub
     }
 }
 
+// 字节序读取仿函数：无状态，operator() 在模板参数位置传入时编译期已知目标，可被内联
+// （相比函数指针参数，避免运行期间接调用）。
+struct LeRead32
+{
+    uint32_t operator()(const unsigned char* p) const { return rdLe32(p); }
+};
+struct BeRead32
+{
+    uint32_t operator()(const unsigned char* p) const { return rdBe32(p); }
+};
+
 // 经典 pcap 记录遍历（24 字节全局头 + 16 字节记录头 + 数据）。LE/BE/微秒/纳秒四种组合仅字节序与
-// 时间戳单位不同，故用读取函子 rd32（rdLe32/rdBe32）与除数 tsDiv（1e6/1e9）参数化，共用一份循环。
+// 时间戳单位不同，故用读取仿函数 Read32（LeRead32/BeRead32）与除数 tsDiv（1e6/1e9）参数化，共用一份循环。
+template <typename Read32>
 void parseClassicPcap(PcapFileReader& reader, uint64_t fileSize,
-                      uint32_t (*rd32)(const unsigned char*), double tsDiv, int linkType,
-                      std::vector<std::shared_ptr<Packet>>& packets)
+                      Read32 rd32, double tsDiv, int linkType,
+                      std::vector<std::shared_ptr<Packet>>& packets,
+                      NativePacketParser::IsoTpReassembler* isoTp)
 {
     uint64_t pos   = 24;
     int      frame = 1;
@@ -136,7 +150,7 @@ void parseClassicPcap(PcapFileReader& reader, uint64_t fileSize,
         p.cap_len      = caplen;
         p.len          = origlen ? origlen : caplen;
         p.file_offset  = dataOff;
-        NativePacketParser::parseFrame(data, caplen, p, linkType);
+        NativePacketParser::parseFrame(data, caplen, p, linkType, isoTp);
 
         packets.push_back(std::make_shared<Packet>(std::move(p)));
         pos += 16 + static_cast<uint64_t>(caplen);
@@ -151,6 +165,8 @@ bool NativeAnalyzer::analyzeFile(const std::string& filePath,
     packets_.clear();
     analyzed_  = false;
     linkType_  = 1;
+    canReplayCache_  = NativePacketParser::IsoTpReassembler();
+    canReplayedUpTo_ = 0;
 
     if (!reader_.open(filePath))
     {
@@ -171,9 +187,13 @@ bool NativeAnalyzer::analyzeFile(const std::string& filePath,
         return false;
     }
 
+    // 跨帧 ISO-TP 状态：整份文件共享一个重组器，三处 parseFrame 调用（经典 pcap / pcapng EPB / SPB）
+    // 都喂给它，保证顺序解析时同一 CAN 总线上的多帧 UDS 报文能被正确累积。
+    NativePacketParser::IsoTpReassembler isoTp;
+
     if (isPcapLe(head) || isPcapLeNano(head))
     {
-        // 经典小端 pcap：24 字节全局头 + 16 字节记录头。微秒版除数 1e6，纳秒版 1e9。
+        // 微秒版除数 1e6，纳秒版 1e9。
         const unsigned char* gh = reader_.viewAt(0, 24);
         if (!gh)
             return false;
@@ -181,18 +201,17 @@ bool NativeAnalyzer::analyzeFile(const std::string& filePath,
         uint32_t linkType = normalizeLinkType(rdLe32(gh + 20));
         linkType_         = static_cast<int>(linkType);
         double tsDiv      = isPcapLeNano(head) ? 1e9 : 1e6;
-        parseClassicPcap(reader_, fileSize, &rdLe32, tsDiv, static_cast<int>(linkType), packets_);
+        parseClassicPcap(reader_, fileSize, LeRead32(), tsDiv, static_cast<int>(linkType), packets_, &isoTp);
     }
     else if (isPcapBe(head) || isPcapBeNano(head))
     {
-        // 经典大端 pcap：同布局，字段大端。
         const unsigned char* gh = reader_.viewAt(0, 24);
         if (!gh)
             return false;
         uint32_t linkType = normalizeLinkType(rdBe32(gh + 20));
         linkType_         = static_cast<int>(linkType);
         double tsDiv      = isPcapBeNano(head) ? 1e9 : 1e6;
-        parseClassicPcap(reader_, fileSize, &rdBe32, tsDiv, static_cast<int>(linkType), packets_);
+        parseClassicPcap(reader_, fileSize, BeRead32(), tsDiv, static_cast<int>(linkType), packets_, &isoTp);
     }
     else if (isPcapNg(head))
     {
@@ -252,7 +271,7 @@ bool NativeAnalyzer::analyzeFile(const std::string& filePath,
                 p.cap_len      = capLen;
                 p.len          = origLen ? origLen : capLen;
                 p.file_offset  = dataOff;
-                NativePacketParser::parseFrame(data, capLen, p, lt);
+                NativePacketParser::parseFrame(data, capLen, p, lt, &isoTp);
                 packets_.push_back(std::make_shared<Packet>(std::move(p)));
                 ++frame;
             }
@@ -276,7 +295,7 @@ bool NativeAnalyzer::analyzeFile(const std::string& filePath,
                 p.cap_len      = capLen;
                 p.len          = origLen;
                 p.file_offset  = dataOff;
-                NativePacketParser::parseFrame(data, capLen, p, lt);
+                NativePacketParser::parseFrame(data, capLen, p, lt, &isoTp);
                 packets_.push_back(std::make_shared<Packet>(std::move(p)));
                 ++frame;
             }
@@ -314,7 +333,32 @@ bool NativeAnalyzer::getPacketDetailTree(uint32_t frameNumber, DetailNode& root)
     const unsigned char* raw = reader_.viewAt(p.file_offset, p.cap_len);
     if (!raw)
         return false;
-    return NativePacketParser::buildDetailTree(raw, p.cap_len, linkType_, frameNumber, root);
+
+    // CAN 链路：需要此帧之前所有历史帧预热重组器状态，才能让中间的 Consecutive Frame 也显示
+    // 完整重组后的 UDS 内容。canReplayCache_ 缓存"已喂入到第几帧"，顺序浏览（UI 常见操作）时
+    // 只需增量喂入新增的那几帧；往回跳到更早的帧才需要整体重置重放（详见头文件字段注释）。
+    bool     isCanLink = (linkType_ == 227 || linkType_ == 228 || linkType_ == 229);
+    uint32_t target    = frameNumber - 1; // 需要喂入的历史帧数（此帧之前的帧）
+    if (isCanLink)
+    {
+        if (canReplayedUpTo_ > target)
+        {
+            canReplayCache_  = NativePacketParser::IsoTpReassembler();
+            canReplayedUpTo_ = 0;
+        }
+        for (; canReplayedUpTo_ < target; ++canReplayedUpTo_)
+        {
+            const Packet&         hp   = *packets_[canReplayedUpTo_];
+            const unsigned char*  praw = reader_.viewAt(hp.file_offset, hp.cap_len);
+            if (praw)
+                NativePacketParser::feedCanFrame(praw, hp.cap_len, linkType_, canReplayCache_);
+        }
+    }
+    // 用缓存状态的一份拷贝喂给 buildDetailTree：它内部还会 feed 当前帧本身，那次 feed 不应
+    // 污染缓存（缓存语义是"已喂入到 target 帧"，当前帧尚未计入）。
+    NativePacketParser::IsoTpReassembler isoTp = canReplayCache_;
+    return NativePacketParser::buildDetailTree(raw, p.cap_len, linkType_, frameNumber, root,
+                                               isCanLink ? &isoTp : nullptr);
 }
 
 bool NativeAnalyzer::getFramesByDisplayFilter(const std::string& expr,

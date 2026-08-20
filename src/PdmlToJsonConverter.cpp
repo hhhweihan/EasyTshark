@@ -111,7 +111,6 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
             return false;
         }
 
-        // 添加pdml属性，但跳过version、creator、time和capture_file
         for (rapidxml::xml_attribute<>* attr = pdmlNode->first_attribute(); attr;
              attr                            = attr->next_attribute())
         {
@@ -173,7 +172,6 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
                                                allocator);
                         }
 
-                        // 递归展开嵌套的 field 子节点
                         if (fieldNode->first_node("field"))
                         {
                             rapidjson::Value subFieldArray(rapidjson::kArrayType);
@@ -218,7 +216,6 @@ bool PdmlToJsonConverter::convertXmlToJson(const std::string& xmlFile, const std
 
         jsonDoc.AddMember("pdml", pdmlObj, allocator);
 
-        // 翻译showname字段，针对所有数据包的proto字段
         if (jsonDoc.HasMember("pdml") &&
             jsonDoc["pdml"].HasMember("packet") &&
             jsonDoc["pdml"]["packet"].IsArray() &&

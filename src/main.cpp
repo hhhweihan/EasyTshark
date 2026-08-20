@@ -101,7 +101,7 @@ int main(int argc, char* argv[])
     loguru::init(argc, argv);
     loguru::add_file(capture_log_name.c_str(), loguru::Append, loguru::Verbosity_MAX);
 
-    // 自动定位 tshark：环境变量 EASYTSHARK_TSHARK → 默认路径 → PATH →（Win）注册表 → 常见目录。
+    // 解析顺序见 TsharkCommand::resolveTsharkPath 的实现注释。
     std::string     tsharkPath = TsharkCommand::resolveTsharkPath();
     AnalysisSession session(tsharkPath, "data");
 

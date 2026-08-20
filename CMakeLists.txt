@@ -61,6 +61,7 @@ set(LIB_SOURCES
     src/NativeCapture.cpp
     src/xdb_search.cc
     src/processUtil.cpp
+    src/ProcessResolver.cpp
     src/web/WebServer.cpp
 )
 

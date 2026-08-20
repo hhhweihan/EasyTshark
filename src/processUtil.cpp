@@ -145,7 +145,7 @@ FILE* spawnWithPipe(const std::string& cmdline, ProcessUtil::ProcHandle* pidOut,
     FILE* fp = _fdopen(fd, readMode ? "r" : "w");
     if (!fp)
     {
-        _close(fd); // 连带关闭底层句柄
+        _close(fd);
         return nullptr;
     }
     return fp;
@@ -241,7 +241,7 @@ int ProcessUtil::PcloseEx(FILE* pipe, ProcHandle pid)
     if (!pipe)
         return -1;
 
-    fclose(pipe); // 连带关闭底层管道句柄
+    fclose(pipe);
 
     DWORD exitCode = 0;
     if (ValidProc(pid))
@@ -405,7 +405,7 @@ FILE* ProcessUtil::PopenEx(const std::vector<std::string>& argv, ProcHandle* pid
             dup2(pipefd[0], STDIN_FILENO);
         }
 
-        // 用 execvp 直接执行程序，不经过 /bin/sh，参数不会被 shell 解释
+        // 同 Exec：execvp 不经 shell，规避元字符注入
         execvp(cargv[0], cargv.data());
         _exit(127);
     }

@@ -3,7 +3,6 @@
 #include <cerrno>
 #include <cstdio>
 #include <fstream>
-#include <set>
 #include <sys/stat.h>
 
 #if defined(_WIN32)
@@ -94,7 +93,8 @@ AnalysisSession::AnalysisSession(const std::string& tsharkPath, const std::strin
       // 初始为空快照（非 null）：调用方无需检查空指针即可安全解引用。
       packets_(std::make_shared<const std::vector<std::shared_ptr<Packet>>>()),
       // 后端选择：tshark 不可用时降级到自研引擎（libpcap + 内置解析），否则优先用 tshark。
-      native_(!TsharkCommand::tsharkAvailable(tsharkPath))
+      native_(!TsharkCommand::tsharkAvailable(tsharkPath)),
+      processResolver_(new ProcessResolver())
 {
     if (native_)
     {
@@ -150,7 +150,6 @@ bool AnalysisSession::loadPcap(const std::string& srcPath)
         return false;
     }
 
-    // 按时间戳留一份到 pcaps 目录，历史不覆盖；db 与之一一对应。
     std::string ts       = CommonUtil::get_timestamp();
     std::string destPcap = pcapsDir_ + "/capture_" + ts + ".pcap";
     std::string destDb   = pcapsDir_ + "/packets_" + ts + ".db";
@@ -267,7 +266,8 @@ bool AnalysisSession::queryDisplayFilter(const std::string&                    d
         }
     }
     // 从既有快照按帧号取报文，沿用快照里权威的 file_offset，过滤结果仍能正确取 hex。
-    std::set<uint32_t> keep(frames.begin(), frames.end());
+    // frames（getFramesByDisplayFilter 按 packets_ 顺序产出）与 *snap 都已按 frame_number
+    // 升序排列，双指针归并一次线性扫描即可，无需再建 set 后逐元素 count() 查找。
     std::shared_ptr<const std::vector<std::shared_ptr<Packet>>> snap;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -277,11 +277,16 @@ bool AnalysisSession::queryDisplayFilter(const std::string&                    d
     {
         return false;
     }
+    size_t fi = 0;
     for (const std::shared_ptr<Packet>& p : *snap)
     {
-        if (keep.count(static_cast<uint32_t>(p->frame_number)) > 0)
+        uint32_t fn = static_cast<uint32_t>(p->frame_number);
+        while (fi < frames.size() && frames[fi] < fn)
+            ++fi;
+        if (fi < frames.size() && frames[fi] == fn)
         {
             out.push_back(p);
+            ++fi;
         }
     }
     return true;
@@ -413,7 +418,7 @@ bool AnalysisSession::exportPacketsCsv(const std::string& csvPath)
     char timeBuf[64];
     for (const std::shared_ptr<Packet>& p : *snap)
     {
-        // time 是 epoch 浮点秒，转成可读时间戳（毫秒精度）
+        // time 是 epoch 浮点秒，格式化成保留 3 位小数的字符串（毫秒精度）
         std::snprintf(timeBuf, sizeof(timeBuf), "%.3f", p->time);
         out << p->frame_number << ',' << timeBuf << ','
             << csvField(p->src_mac) << ',' << csvField(p->src_ip) << ',' << csvField(p->src_location)
@@ -444,16 +449,25 @@ bool AnalysisSession::startLiveCapture(const std::string&           adapterName,
         LOG_F(WARNING, "已在抓包中，忽略重复的开始请求");
         return false;
     }
-    // 按时间戳直接写入 pcaps 目录，历史不覆盖。
     std::string ts   = CommonUtil::get_timestamp();
     liveCapturePath_ = pcapsDir_ + "/capture_" + ts + ".pcap";
     liveDbPath_      = pcapsDir_ + "/packets_" + ts + ".db";
+
+    // 两条抓包引擎的 PacketCallback 类型完全一致，包一层即可让二者同时获得进程归属能力：
+    // 离线回放不会走这条路径，故 proc_name/proc_pid 天然只在实时抓包时被填充。
+    ProcessResolver*             resolver = processResolver_.get();
+    LiveCapture::PacketCallback  wrapped  = [onPacket, resolver](const std::shared_ptr<Packet>& p)
+    {
+        resolver->annotate(*p);
+        if (onPacket)
+            onPacket(p);
+    };
 
     if (native_)
     {
         // 自研抓包：libpcap 直接抓，无需 tshark 路径。
         nativeCapture_.reset(new NativeCapture());
-        if (!nativeCapture_->startCapture(adapterName, std::move(onPacket), liveCapturePath_,
+        if (!nativeCapture_->startCapture(adapterName, std::move(wrapped), liveCapturePath_,
                                           durationSeconds))
         {
             nativeCapture_.reset();
@@ -463,7 +477,7 @@ bool AnalysisSession::startLiveCapture(const std::string&           adapterName,
     else
     {
         capture_.reset(new LiveCapture(tsharkPath_));
-        if (!capture_->startCapture(adapterName, std::move(onPacket), liveCapturePath_,
+        if (!capture_->startCapture(adapterName, std::move(wrapped), liveCapturePath_,
                                     durationSeconds))
         {
             capture_.reset();

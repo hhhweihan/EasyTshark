@@ -92,7 +92,7 @@ int main(int argc, char* argv[])
     svr.set_payload_max_length(16u * 1024 * 1024);
     registerWebRoutes(svr, session, token);
 
-    // 托管静态前端；根路径重定向到 index.html。
+    // 托管静态前端：httplib 挂载该目录后，访问 / 会在目录内回退到 index.html（非 HTTP 重定向）。
     std::string webRoot = resolveWebRoot();
     if (!svr.set_mount_point("/", webRoot))
         LOG_F(WARNING, "静态目录挂载失败：%s（API 仍可用，页面不可用）", webRoot.c_str());

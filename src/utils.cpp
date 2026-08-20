@@ -256,7 +256,7 @@ std::string CommonUtil::get_timestamp()
 void CommonUtil::pruneLogFiles(const std::string& dir, size_t keep)
 {
 #if defined(_WIN32)
-    // Windows 下用 _findfirst/_findnext 枚举 *.log；按文件名时间戳排序后删除最旧的。
+    // Windows 下用 _findfirst/_findnext 枚举 *.log；按修改时间排序后删除最旧的（见下方 sort）。
     std::vector<std::string> files;
     std::string              pattern = dir + "\\*.log";
     struct _finddata_t       fd;
@@ -722,6 +722,56 @@ std::string SQLiteUtil::buildFuzzyQuery(const std::map<std::string, std::string>
     return sql;
 }
 
+namespace
+{
+// StringRef 引用 Packet 已有内存，避免再拷贝；packet 须在序列化完成前存活，不悬垂。
+rapidjson::Value packetToJsonValue(const Packet& packet, rapidjson::Document::AllocatorType& allocator)
+{
+    rapidjson::Value packetObj(rapidjson::kObjectType);
+    packetObj.AddMember("frame_number", rapidjson::Value(packet.frame_number), allocator);
+    packetObj.AddMember("time", rapidjson::Value(packet.time), allocator);
+    packetObj.AddMember("cap_len", rapidjson::Value(packet.cap_len), allocator);
+    packetObj.AddMember("len", rapidjson::Value(packet.len), allocator);
+    packetObj.AddMember("src_mac", rapidjson::StringRef(packet.src_mac.c_str()), allocator);
+    packetObj.AddMember("dst_mac", rapidjson::StringRef(packet.dst_mac.c_str()), allocator);
+    packetObj.AddMember("src_ip", rapidjson::StringRef(packet.src_ip.c_str()), allocator);
+    packetObj.AddMember("src_location", rapidjson::StringRef(packet.src_location.c_str()),
+                        allocator);
+    packetObj.AddMember("src_port", rapidjson::Value(packet.src_port), allocator);
+    packetObj.AddMember("dst_ip", rapidjson::StringRef(packet.dst_ip.c_str()), allocator);
+    packetObj.AddMember("dst_location", rapidjson::StringRef(packet.dst_location.c_str()),
+                        allocator);
+    packetObj.AddMember("dst_port", rapidjson::Value(packet.dst_port), allocator);
+    packetObj.AddMember("protocol", rapidjson::StringRef(packet.protocol.c_str()), allocator);
+    packetObj.AddMember("info", rapidjson::StringRef(packet.info.c_str()), allocator);
+    packetObj.AddMember("file_offset", rapidjson::Value(static_cast<uint64_t>(packet.file_offset)),
+                        allocator);
+    packetObj.AddMember("transport", rapidjson::StringRef(packet.transport.c_str()), allocator);
+    packetObj.AddMember("can_id", rapidjson::Value(packet.can_id), allocator);
+    packetObj.AddMember("proc_name", rapidjson::StringRef(packet.proc_name.c_str()), allocator);
+    packetObj.AddMember("proc_pid", rapidjson::Value(packet.proc_pid), allocator);
+    return packetObj;
+}
+} // namespace
+
+rapidjson::Value
+CommonUtil::packetsToJsonValue(std::vector<std::shared_ptr<Packet>>::const_iterator begin,
+                               std::vector<std::shared_ptr<Packet>>::const_iterator end,
+                               rapidjson::Document::AllocatorType&                  allocator)
+{
+    rapidjson::Value arr(rapidjson::kArrayType);
+    arr.Reserve(static_cast<rapidjson::SizeType>(std::distance(begin, end)), allocator);
+    for (auto it = begin; it != end; ++it)
+        arr.PushBack(packetToJsonValue(**it, allocator), allocator);
+    return arr;
+}
+
+rapidjson::Value CommonUtil::packetsToJsonValue(const std::vector<std::shared_ptr<Packet>>& packets,
+                                                rapidjson::Document::AllocatorType& allocator)
+{
+    return packetsToJsonValue(packets.begin(), packets.end(), allocator);
+}
+
 std::string CommonUtil::packetsToJson(const std::vector<std::shared_ptr<Packet>>& packets)
 {
     rapidjson::Document document;
@@ -729,38 +779,7 @@ std::string CommonUtil::packetsToJson(const std::vector<std::shared_ptr<Packet>>
     rapidjson::Document::AllocatorType& allocator = document.GetAllocator();
 
     document.AddMember("total", rapidjson::Value((int)packets.size()), allocator);
-
-    rapidjson::Value packetsArray(rapidjson::kArrayType);
-    packetsArray.Reserve(static_cast<rapidjson::SizeType>(packets.size()), allocator);
-
-    for (const auto& packet : packets)
-    {
-        rapidjson::Value packetObj(rapidjson::kObjectType);
-
-        // StringRef 引用 Packet 已有内存，避免再拷贝；packet 在序列化完成前存活，不悬垂。
-        packetObj.AddMember("frame_number", rapidjson::Value(packet->frame_number), allocator);
-        packetObj.AddMember("time", rapidjson::Value(packet->time), allocator);
-        packetObj.AddMember("cap_len", rapidjson::Value(packet->cap_len), allocator);
-        packetObj.AddMember("len", rapidjson::Value(packet->len), allocator);
-        packetObj.AddMember("src_mac", rapidjson::StringRef(packet->src_mac.c_str()), allocator);
-        packetObj.AddMember("dst_mac", rapidjson::StringRef(packet->dst_mac.c_str()), allocator);
-        packetObj.AddMember("src_ip", rapidjson::StringRef(packet->src_ip.c_str()), allocator);
-        packetObj.AddMember("src_location", rapidjson::StringRef(packet->src_location.c_str()),
-                            allocator);
-        packetObj.AddMember("src_port", rapidjson::Value(packet->src_port), allocator);
-        packetObj.AddMember("dst_ip", rapidjson::StringRef(packet->dst_ip.c_str()), allocator);
-        packetObj.AddMember("dst_location", rapidjson::StringRef(packet->dst_location.c_str()),
-                            allocator);
-        packetObj.AddMember("dst_port", rapidjson::Value(packet->dst_port), allocator);
-        packetObj.AddMember("protocol", rapidjson::StringRef(packet->protocol.c_str()), allocator);
-        packetObj.AddMember("info", rapidjson::StringRef(packet->info.c_str()), allocator);
-        packetObj.AddMember("file_offset",
-                            rapidjson::Value(static_cast<uint64_t>(packet->file_offset)), allocator);
-
-        packetsArray.PushBack(packetObj, allocator);
-    }
-
-    document.AddMember("packets", packetsArray, allocator);
+    document.AddMember("packets", packetsToJsonValue(packets, allocator), allocator);
 
     rapidjson::StringBuffer                    buffer;
     rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);

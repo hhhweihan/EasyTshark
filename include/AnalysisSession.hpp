@@ -14,6 +14,7 @@
 #include "NativeCapture.hpp"
 #include "PcapAnalyzer.hpp"
 #include "PdmlToJsonConverter.hpp"
+#include "ProcessResolver.hpp"
 #include "tsharkDataType.hpp"
 #include "utils.hpp"
 
@@ -115,6 +116,9 @@ private:
     // nativeAnalyzer_ 仅在 native_ 时使用；与 analyzer_ 同受 analyzerMutex_ 保护。
     bool                           native_ = false;
     std::unique_ptr<NativeAnalyzer> nativeAnalyzer_;
+
+    // 实时抓包时反查每个包的归属进程；仅 macOS/Linux 生效，其他平台/离线回放恒为 no-op。
+    std::unique_ptr<ProcessResolver> processResolver_;
 
     // 保护 packets_ 快照（原子交换的 shared_ptr，读写双方均持锁拷贝引用计数）
     mutable std::mutex                                                       mutex_;

@@ -236,6 +236,87 @@ std::vector<unsigned char> makePcapFile(const std::vector<unsigned char>& f1,
     pushBytes(v, f2);
     return v;
 }
+
+// 指定链路类型的单包 pcap（小端），供 CAN 等非以太网链路测试
+std::vector<unsigned char> makePcapFileLinkType(uint32_t linkType,
+                                                const std::vector<unsigned char>& f1)
+{
+    std::vector<unsigned char> v;
+    pushLe32(v, 0xa1b2c3d4);
+    pushLe16(v, 2);
+    pushLe16(v, 4);
+    pushLe32(v, 0);
+    pushLe32(v, 0);
+    pushLe32(v, 65535);
+    pushLe32(v, linkType);
+    pushLe32(v, 1); // ts_sec
+    pushLe32(v, 0);
+    pushLe32(v, static_cast<uint32_t>(f1.size()));
+    pushLe32(v, static_cast<uint32_t>(f1.size()));
+    pushBytes(v, f1);
+    return v;
+}
+
+// ---- 汽车协议帧构造 ----
+// DoIP 帧：Ethernet/IPv4/TCP(13400) + DoIP 头（ISO 13400-2:2012）+ 负载
+std::vector<unsigned char> doipTcpFrame(uint16_t payloadType,
+                                        const std::vector<unsigned char>& body)
+{
+    std::vector<unsigned char> doip;
+    pushByte(doip, 0x02); // version
+    pushByte(doip, 0xFD); // inverse version
+    pushBE16(doip, payloadType);
+    pushBE32(doip, static_cast<uint32_t>(body.size()));
+    pushBytes(doip, body);
+    uint16_t tcpLen = static_cast<uint16_t>(20 + doip.size());
+    auto     eth    = ethHeader(0x0800);
+    auto     ip     = ipv4Header("192.168.1.10", "192.168.1.20", 6,
+                                 static_cast<uint16_t>(20 + tcpLen));
+    auto tcp = tcpHeader(49152, 13400, 0x18); // PSH+ACK
+    std::vector<unsigned char> frame;
+    pushBytes(frame, eth);
+    pushBytes(frame, ip);
+    pushBytes(frame, tcp);
+    pushBytes(frame, doip);
+    return frame;
+}
+
+// SocketCAN（DLT 227）经典帧：can_id(LE) + DLC + 数据（数据区从偏移 8 起）
+std::vector<unsigned char> canSocketcanFrame(uint32_t canId, uint8_t dlc,
+                                             const std::vector<unsigned char>& data)
+{
+    std::vector<unsigned char> v;
+    pushLe32(v, canId);
+    pushByte(v, dlc);
+    pushByte(v, 0); // pad
+    pushByte(v, 0); // res0
+    pushByte(v, 0); // len8_dlc
+    pushBytes(v, data);
+    return v;
+}
+
+// SocketCAN（DLT 227）CAN FD 帧：can_id(LE) + flags + len + 数据
+std::vector<unsigned char> canFdSocketcanFrame(uint32_t canId, uint8_t flags, uint8_t len,
+                                               const std::vector<unsigned char>& data)
+{
+    std::vector<unsigned char> v;
+    pushLe32(v, canId);
+    pushByte(v, flags);
+    pushByte(v, len);
+    pushByte(v, 0); // res0
+    pushByte(v, 0); // res1
+    pushBytes(v, data);
+    return v;
+}
+
+// 原始 CAN（DLT 228/229）：can_id(LE，高 3 位 EFF/RTR/ERR 标志) + 数据
+std::vector<unsigned char> rawCanFrame(uint32_t canId, const std::vector<unsigned char>& data)
+{
+    std::vector<unsigned char> v;
+    pushLe32(v, canId);
+    pushBytes(v, data);
+    return v;
+}
 } // namespace
 
 // ---- NativePacketParser ----
@@ -376,6 +457,159 @@ TEST(NativeParserTest, DisplayFilterBasics)
     EXPECT_FALSE(badErr.empty());
 }
 
+// ---- 汽车协议：DoIP / UDS / CAN ----
+TEST(NativeParserTest, ParsesDoipUdsRequest)
+{
+    // 诊断消息（0x8001）：源地址(2) + 目标地址(2) + UDS（DiagnosticSessionControl 请求）
+    std::vector<unsigned char> body;
+    pushBE16(body, 0x0E80); // 源逻辑地址
+    pushBE16(body, 0x0001); // 目标逻辑地址
+    pushByte(body, 0x10);   // SID DiagnosticSessionControl
+    pushByte(body, 0x03);   // 子功能 extendedDiagnosticSession
+    auto frame = doipTcpFrame(0x8001, body);
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p));
+    EXPECT_EQ(p.protocol, "UDS");
+    EXPECT_EQ(p.dst_port, 13400);
+    EXPECT_NE(p.info.find("DiagnosticSessionControl"), std::string::npos);
+    EXPECT_NE(p.info.find("0x10"), std::string::npos);
+}
+
+TEST(NativeParserTest, ParsesDoipRoutingActivation)
+{
+    // 路由激活请求（0x0005），无 UDS 负载
+    std::vector<unsigned char> body;
+    pushByte(body, 0x0E);
+    pushByte(body, 0x80);
+    pushByte(body, 0x00); // 激活类型
+    pushByte(body, 0x00);
+    pushByte(body, 0x00); // 保留
+    pushByte(body, 0x00);
+    pushByte(body, 0x00); // 保留
+    pushByte(body, 0x00);
+    auto frame = doipTcpFrame(0x0005, body);
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p));
+    EXPECT_EQ(p.protocol, "DoIP");
+    EXPECT_NE(p.info.find("Routing activation request"), std::string::npos);
+    EXPECT_NE(p.info.find("0x0005"), std::string::npos);
+}
+
+TEST(NativeParserTest, ParsesDoipUdsNegativeResponse)
+{
+    // UDS 负响应：7F <SID> <NRC>
+    std::vector<unsigned char> body;
+    pushBE16(body, 0x0E80);
+    pushBE16(body, 0x0001);
+    pushByte(body, 0x7F); // 负响应
+    pushByte(body, 0x10); // 原服务
+    pushByte(body, 0x31); // NRC RequestOutOfRange
+    auto frame = doipTcpFrame(0x8001, body);
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p));
+    EXPECT_EQ(p.protocol, "UDS");
+    EXPECT_NE(p.info.find("Negative response"), std::string::npos);
+    EXPECT_NE(p.info.find("Request out of range"), std::string::npos);
+}
+
+TEST(NativeParserTest, ParsesCanSocketcan)
+{
+    std::vector<unsigned char> data = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+    auto frame = canSocketcanFrame(0x123, 0x08, data);
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p, 227));
+    EXPECT_EQ(p.protocol, "CAN");
+    EXPECT_EQ(p.can_id, 0x123u);
+    EXPECT_NE(p.info.find("0x123"), std::string::npos);
+    EXPECT_NE(p.info.find("DLC=8"), std::string::npos);
+    EXPECT_NE(p.info.find("01 02 03 04"), std::string::npos);
+}
+
+TEST(NativeParserTest, ParsesCanFdSocketcan)
+{
+    std::vector<unsigned char> data(64, 0xAA);
+    auto frame = canFdSocketcanFrame(0x1FED, 0x80, 64, data); // FDF=0x80 → CAN FD
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p, 227));
+    EXPECT_EQ(p.protocol, "CAN FD");
+    EXPECT_EQ(p.can_id, 0x1FEDu);
+    EXPECT_NE(p.info.find("CAN FD"), std::string::npos);
+}
+
+TEST(NativeParserTest, ParsesUdsOverCanSingleFrame)
+{
+    // CAN 0x123 上的 ISO-TP 单帧：PCI=0x02（长度 2），UDS = 3E 00（TesterPresent）
+    std::vector<unsigned char> data;
+    pushHex(data, "023e000000000000");
+    auto frame = canSocketcanFrame(0x123, 0x08, data);
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p, 227));
+    EXPECT_EQ(p.protocol, "UDS");
+    EXPECT_EQ(p.can_id, 0x123u);
+    EXPECT_NE(p.info.find("TesterPresent"), std::string::npos);
+}
+
+TEST(NativeParserTest, ParsesRawCan)
+{
+    // 数据区不以已知 UDS SID 开头 → 按普通 CAN 帧解析
+    std::vector<unsigned char> data = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
+    auto frame = rawCanFrame(0x456, data);
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p, 228));
+    EXPECT_EQ(p.protocol, "CAN");
+    EXPECT_EQ(p.can_id, 0x456u);
+    EXPECT_NE(p.info.find("0x456"), std::string::npos);
+    // 29 位扩展帧（EFF 标志）
+    auto ext = rawCanFrame(0x80000000 | 0x1FED123, data);
+    Packet pe;
+    ASSERT_TRUE(NativePacketParser::parseFrame(ext.data(), static_cast<uint32_t>(ext.size()), pe,
+                                               228));
+    EXPECT_EQ(pe.can_id, 0x1FED123u);
+    EXPECT_NE(pe.info.find("0x01fed123"), std::string::npos);
+    // 原始 CAN 上携带 UDS（数据区以已知 SID 0x3E 开头）
+    std::vector<unsigned char> udsData = {0x3E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    auto uframe = rawCanFrame(0x7E0, udsData);
+    Packet pu;
+    ASSERT_TRUE(NativePacketParser::parseFrame(uframe.data(),
+                                               static_cast<uint32_t>(uframe.size()), pu, 228));
+    EXPECT_EQ(pu.protocol, "UDS");
+    EXPECT_NE(pu.info.find("TesterPresent"), std::string::npos);
+}
+
+TEST(NativeParserTest, AutomotiveDisplayFilters)
+{
+    std::vector<unsigned char> body;
+    pushBE16(body, 0x0E80);
+    pushBE16(body, 0x0001);
+    pushByte(body, 0x3E); // TesterPresent
+    pushByte(body, 0x00);
+    auto doip = doipTcpFrame(0x8001, body);
+    std::vector<unsigned char> canData = {0, 0, 0, 0, 0, 0, 0, 0};
+    auto can  = canSocketcanFrame(0x123, 8, canData);
+    Packet doipP, canP;
+    ASSERT_TRUE(NativePacketParser::parseFrame(doip.data(), static_cast<uint32_t>(doip.size()),
+                                               doipP));
+    ASSERT_TRUE(NativePacketParser::parseFrame(can.data(), static_cast<uint32_t>(can.size()), canP,
+                                               227));
+    std::string err;
+    EXPECT_TRUE(NativePacketParser::matchDisplayFilter("doip", doipP, &err));
+    EXPECT_TRUE(NativePacketParser::matchDisplayFilter("uds", doipP, &err));
+    EXPECT_TRUE(NativePacketParser::matchDisplayFilter("doip || uds", doipP, &err));
+    EXPECT_TRUE(NativePacketParser::matchDisplayFilter("can", canP, &err));
+    EXPECT_TRUE(NativePacketParser::matchDisplayFilter("can.id==0x123", canP, &err));
+    EXPECT_TRUE(NativePacketParser::matchDisplayFilter("can.id==291", canP, &err)); // 十进制
+    EXPECT_FALSE(NativePacketParser::matchDisplayFilter("can.id==0x124", canP, &err));
+    EXPECT_FALSE(NativePacketParser::matchDisplayFilter("doip", canP, &err));
+    EXPECT_TRUE(err.empty());
+}
+
 // ---- NativeAnalyzer（离线 pcap 解析）----
 class NativeAnalyzerTest : public ::testing::Test {
 protected:
@@ -443,6 +677,46 @@ TEST_F(NativeAnalyzerTest, AnalyzesPcapAndHex)
     std::vector<uint32_t> bad;
     EXPECT_FALSE(analyzer.getFramesByDisplayFilter("bogus.field==1", bad, &err));
     EXPECT_FALSE(err.empty());
+}
+
+TEST_F(NativeAnalyzerTest, AnalyzesCanLinkTypePcap)
+{
+    // 链路类型 227（SocketCAN）的 pcap：解析 CAN 帧 + 详情树 + 显示过滤
+    std::vector<unsigned char> data;
+    pushHex(data, "023e000000000000"); // ISO-TP 单帧：TesterPresent
+    auto canFrame = canSocketcanFrame(0x123, 8, data);
+    auto bytes    = makePcapFileLinkType(227, canFrame);
+    std::string canPath = "test_data/native_can.pcap";
+    {
+        std::ofstream out(canPath.c_str(), std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    NativeAnalyzer analyzer;
+    std::vector<std::shared_ptr<Packet>> packets;
+    ASSERT_TRUE(analyzer.analyzeFile(canPath, packets));
+    ASSERT_EQ(packets.size(), 1u);
+    EXPECT_EQ(packets[0]->protocol, "UDS");
+    EXPECT_EQ(packets[0]->can_id, 0x123u);
+    EXPECT_NE(packets[0]->info.find("TesterPresent"), std::string::npos);
+
+    DetailNode root;
+    ASSERT_TRUE(analyzer.getPacketDetailTree(1, root));
+    bool hasCan = false, hasUds = false;
+    for (const auto& c : root.children)
+    {
+        if (c.label == "Controller Area Network")
+            hasCan = true;
+        if (c.label == "Unified Diagnostic Services")
+            hasUds = true;
+    }
+    EXPECT_TRUE(hasCan);
+    EXPECT_TRUE(hasUds);
+
+    std::vector<uint32_t> frames;
+    ASSERT_TRUE(analyzer.getFramesByDisplayFilter("can.id==0x123 && uds", frames));
+    ASSERT_EQ(frames.size(), 1u);
+    std::remove(canPath.c_str());
 }
 
 // ---- AnalysisSession native 集成（无 tshark 时后端自动降级）----
@@ -990,4 +1264,206 @@ TEST(NativeParserTest, ParsesSll2)
     EXPECT_EQ(p.dst_ip, "10.2.2.2");
     EXPECT_EQ(p.dst_port, 53);
     EXPECT_EQ(p.transport, "UDP");
+}
+
+// ---- DNS 压缩指针（RFC 1035 §4.1.4）----
+TEST(NativeParserTest, ParsesDnsCnameWithCompressionPointer)
+{
+    std::vector<unsigned char> dns;
+    pushBE16(dns, 0x9999);
+    pushBE16(dns, 0x8180);
+    pushBE16(dns, 1); // QDCOUNT
+    pushBE16(dns, 1); // ANCOUNT
+    pushBE16(dns, 0);
+    pushBE16(dns, 0);
+    // question: example.com A（起始偏移 12）
+    pushByte(dns, 7); pushHex(dns, "6578616d706c65");
+    pushByte(dns, 3); pushHex(dns, "636f6d");
+    pushByte(dns, 0);
+    pushBE16(dns, 1); pushBE16(dns, 1);
+    // answer：name 用压缩指针 0xc00c 指回 offset 12，type=CNAME，rdata 也是指回 offset 12 的压缩指针
+    // （CNAME 目标本身就是 example.com）——验证 rdata 域名解析能跟随压缩指针，而不是截断/乱码。
+    pushHex(dns, "c00c");
+    pushBE16(dns, 5); pushBE16(dns, 1); pushBE32(dns, 300);
+    pushBE16(dns, 2); pushHex(dns, "c00c");
+
+    auto frame = udpPayloadFrame("8.8.8.8", "192.168.1.10", 53, 53000, dns);
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p));
+    EXPECT_EQ(p.protocol, "DNS");
+    EXPECT_NE(p.info.find("CNAME example.com"), std::string::npos);
+}
+
+// ---- SSH（RFC 4253 §4.2，版本交换 banner）----
+TEST(NativeParserTest, ParsesSshBanner)
+{
+    auto payload = strVec("SSH-2.0-OpenSSH_9.6\r\n");
+    auto frame   = tcpPayloadFrame("192.168.1.10", "192.168.1.20", 51000, 22, payload);
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p));
+    EXPECT_EQ(p.protocol, "SSH");
+    EXPECT_NE(p.info.find("SSH-2.0-OpenSSH_9.6"), std::string::npos);
+
+    DetailNode root;
+    ASSERT_TRUE(NativePacketParser::buildDetailTree(
+        frame.data(), static_cast<uint32_t>(frame.size()), 1, 1, root));
+    bool hasSsh = false;
+    for (const auto& c : root.children)
+    {
+        if (c.label != "SSH Protocol")
+            continue;
+        hasSsh = true;
+        ASSERT_FALSE(c.children.empty());
+        EXPECT_NE(c.children[0].value.find("SSH-2.0-OpenSSH_9.6"), std::string::npos);
+    }
+    EXPECT_TRUE(hasSsh);
+}
+
+// ---- IPv6 分片（Fragment Header，proto 44）----
+TEST(NativeParserTest, MarksIpv6Fragment)
+{
+    std::vector<unsigned char> frame = ethHeader(0x86dd);
+    pushBE32(frame, 0x60000000);
+    pushBE16(frame, 8 + 20); // payload len：Fragment Header(8) + TCP 头(20)
+    pushByte(frame, 44);     // next header = Fragment Header
+    pushByte(frame, 64);
+    pushHex(frame, "fe800000000000000000000000000001");
+    pushHex(frame, "fe800000000000000000000000000002");
+    // Fragment Header：next(1)=TCP(6) reserved(1) fragOffset+flags(2) id(4)
+    pushByte(frame, 6);
+    pushByte(frame, 0);
+    pushBE16(frame, 0x0008 | 0x0001); // offset=1（*8=8 字节）+ M=1（还有更多分片）
+    pushBE32(frame, 0x12345678);
+    pushBytes(frame, tcpHeader(51000, 5555, 0x10));
+
+    Packet p;
+    ASSERT_TRUE(NativePacketParser::parseFrame(frame.data(), static_cast<uint32_t>(frame.size()),
+                                               p));
+    EXPECT_EQ(p.protocol, "TCP");
+
+    DetailNode root;
+    ASSERT_TRUE(NativePacketParser::buildDetailTree(
+        frame.data(), static_cast<uint32_t>(frame.size()), 1, 1, root));
+    bool hasFrag = false;
+    for (const auto& layer : root.children)
+        if (layer.label.find("Internet Protocol") != std::string::npos)
+            for (const auto& f : layer.children)
+                if (f.label == "Fragment") hasFrag = true;
+    EXPECT_TRUE(hasFrag);
+}
+
+// ---- ISO-TP（ISO 15765-2）多帧重组 ----
+// 10 字节 UDS 报文（ReadDataByIdentifier 正响应），拆成 First Frame(6 字节) + 1 个 Consecutive Frame(4 字节)。
+std::vector<unsigned char> isoTpUdsPayload()
+{
+    return {0x62, 0xF1, 0x90, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47};
+}
+std::vector<unsigned char> isoTpFirstFrame(const std::vector<unsigned char>& payload)
+{
+    std::vector<unsigned char> d;
+    pushByte(d, 0x10);
+    pushByte(d, static_cast<unsigned char>(payload.size()));
+    for (size_t i = 0; i < 6 && i < payload.size(); ++i) pushByte(d, payload[i]);
+    return d;
+}
+std::vector<unsigned char> isoTpConsecutiveFrame(const std::vector<unsigned char>& payload,
+                                                 uint8_t seq)
+{
+    std::vector<unsigned char> d;
+    pushByte(d, static_cast<unsigned char>(0x20 | (seq & 0x0F)));
+    for (size_t i = 6; i < payload.size(); ++i) pushByte(d, payload[i]);
+    while (d.size() < 8) pushByte(d, 0xAA); // CAN 帧补齐到 8 字节（填充）
+    return d;
+}
+
+TEST(NativeParserTest, ParsesIsoTpMultiFrame)
+{
+    auto payload = isoTpUdsPayload();
+    auto ffFrame = canSocketcanFrame(0x7E8, 8, isoTpFirstFrame(payload));
+    auto cfFrame = canSocketcanFrame(0x7E8, 8, isoTpConsecutiveFrame(payload, 1));
+
+    NativePacketParser::IsoTpReassembler isoTp;
+    Packet pFf;
+    ASSERT_TRUE(NativePacketParser::parseFrame(
+        ffFrame.data(), static_cast<uint32_t>(ffFrame.size()), pFf, 227, &isoTp));
+    EXPECT_NE(pFf.protocol, "UDS"); // 未凑满，不应误报完成
+    EXPECT_NE(pFf.info.find("First Frame"), std::string::npos);
+    EXPECT_NE(pFf.info.find("Len=10"), std::string::npos);
+
+    Packet pCf;
+    ASSERT_TRUE(NativePacketParser::parseFrame(
+        cfFrame.data(), static_cast<uint32_t>(cfFrame.size()), pCf, 227, &isoTp));
+    EXPECT_EQ(pCf.protocol, "UDS");
+    EXPECT_NE(pCf.info.find("ReadDataByIdentifier"), std::string::npos);
+}
+
+// 多帧（小端经典 pcap）：供 NativeAnalyzer 集成测试构造含 FF+CF 的 CAN 抓包文件。
+std::vector<unsigned char> makePcapFileLinkTypeMulti(
+    uint32_t linkType, const std::vector<std::vector<unsigned char>>& frames)
+{
+    std::vector<unsigned char> v;
+    pushLe32(v, 0xa1b2c3d4);
+    pushLe16(v, 2);
+    pushLe16(v, 4);
+    pushLe32(v, 0);
+    pushLe32(v, 0);
+    pushLe32(v, 65535);
+    pushLe32(v, linkType);
+    for (const auto& f : frames)
+    {
+        pushLe32(v, 1); // ts_sec
+        pushLe32(v, 0);
+        pushLe32(v, static_cast<uint32_t>(f.size()));
+        pushLe32(v, static_cast<uint32_t>(f.size()));
+        pushBytes(v, f);
+    }
+    return v;
+}
+
+TEST_F(NativeAnalyzerTest, AnalyzesCanIsoTpMultiFrameAndReplaysDetailTree)
+{
+    auto payload = isoTpUdsPayload();
+    auto ff       = canSocketcanFrame(0x7E8, 8, isoTpFirstFrame(payload));
+    auto cf       = canSocketcanFrame(0x7E8, 8, isoTpConsecutiveFrame(payload, 1));
+    auto bytes    = makePcapFileLinkTypeMulti(227, {ff, cf});
+    std::string path = "test_data/native_isotp.pcap";
+    {
+        std::ofstream out(path.c_str(), std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+
+    NativeAnalyzer analyzer;
+    std::vector<std::shared_ptr<Packet>> packets;
+    ASSERT_TRUE(analyzer.analyzeFile(path, packets));
+    ASSERT_EQ(packets.size(), 2u);
+    EXPECT_NE(packets[0]->protocol, "UDS"); // First Frame 单独看未完成
+    EXPECT_EQ(packets[1]->protocol, "UDS"); // Consecutive Frame 补满后识别为 UDS
+    EXPECT_NE(packets[1]->info.find("ReadDataByIdentifier"), std::string::npos);
+
+    // 只查最后一帧（不预先查前面的帧）：getPacketDetailTree 必须自行重放历史帧，
+    // 才能在按需构建详情树时也看到完整重组后的 UDS 内容。
+    DetailNode root;
+    ASSERT_TRUE(analyzer.getPacketDetailTree(2, root));
+    bool hasUds = false;
+    for (const auto& c : root.children)
+        if (c.label == "Unified Diagnostic Services")
+            hasUds = true;
+    EXPECT_TRUE(hasUds);
+
+    // 乱序往回跳到第 1 帧、再跳回第 2 帧：增量重放缓存必须整体重置重放，不能残留
+    // 跳回前的状态导致重复消费 First Frame 或漏算 Consecutive Frame。
+    DetailNode root1;
+    ASSERT_TRUE(analyzer.getPacketDetailTree(1, root1));
+    DetailNode root2;
+    ASSERT_TRUE(analyzer.getPacketDetailTree(2, root2));
+    bool hasUdsAgain = false;
+    for (const auto& c : root2.children)
+        if (c.label == "Unified Diagnostic Services")
+            hasUdsAgain = true;
+    EXPECT_TRUE(hasUdsAgain);
+
+    std::remove(path.c_str());
 }

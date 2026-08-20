@@ -67,6 +67,9 @@ function protocolClass(proto) {
     const p = (proto || '').toUpperCase();
     if (p.includes('TCP')) return '#8cbfff';
     if (p.includes('UDP')) return '#73d9bf';
+    if (p.includes('DoIP')) return '#f27366';
+    if (p.includes('UDS')) return '#ff9933';
+    if (p.includes('CAN')) return '#66bf8c';
     if (p.includes('DNS')) return '#ffb85a';
     if (p.includes('HTTP')) return '#8ce673';
     if (p.includes('TLS') || p.includes('SSL')) return '#cc99ff';
@@ -184,6 +187,7 @@ function rowHtml(p) {
         + `<td class="proto" style="color:${protocolClass(p.protocol)}">${escapeHtml(p.protocol)}</td>`
         + `<td>${p.len}</td>`
         + `<td>${escapeHtml(p.info)}</td>`
+        + `<td>${p.proc_pid ? escapeHtml(p.proc_name) + ' (' + p.proc_pid + ')' : ''}</td>`
         + `</tr>`;
 }
 
@@ -434,12 +438,23 @@ function renderSessions() {
     const all = aggSource();
     const cat = parseInt($('sessionCategory').value, 10);
     const map = new Map();
+    // CAN 链路报文无 IP 层，从不经过 TCP/UDP 解析：transport 恒为空，protocol 只会是
+    // "UDS"（直接 UDS-over-CAN / ISO-TP 重组完成）或以 "CAN" 开头（普通 CAN/CAN FD 帧）。
+    const isCanLink = (p) => !p.transport && (String(p.protocol || '').startsWith('CAN') || p.protocol === 'UDS');
     for (const p of all) {
-        if (!p.src_ip || !p.dst_ip) continue;
-        const a = p.src_ip + ':' + p.src_port, b = p.dst_ip + ':' + p.dst_port;
-        const key = a < b ? a + '|' + b : b + '|' + a;
+        let key, mk;
+        if (p.src_ip && p.dst_ip) {
+            const a = p.src_ip + ':' + p.src_port, b = p.dst_ip + ':' + p.dst_port;
+            key = a < b ? a + '|' + b : b + '|' + a;
+            mk = () => ({ a: a < b ? a : b, b: a < b ? b : a, transport: p.transport || '', protocols: new Set(), packets: 0, bytes: 0 });
+        } else if (isCanLink(p)) {
+            key = 'CAN|' + (p.can_id || 0);
+            mk = () => ({ a: 'CAN ID 0x' + (p.can_id || 0).toString(16), b: '(总线广播)', transport: 'CAN', protocols: new Set(), packets: 0, bytes: 0 });
+        } else {
+            continue;
+        }
         let si = map.get(key);
-        if (!si) { si = { a: a < b ? a : b, b: a < b ? b : a, transport: p.transport || '', protocols: new Set(), packets: 0, bytes: 0 }; map.set(key, si); }
+        if (!si) { si = mk(); map.set(key, si); }
         if (p.protocol) si.protocols.add(p.protocol);
         si.packets++; si.bytes += p.len || 0;
     }
@@ -452,6 +467,9 @@ function renderSessions() {
             case 4: return has(si, 'HTTP');
             case 5: return has(si, 'TLS') || has(si, 'SSL');
             case 6: return has(si, 'SSH');
+            case 7: return has(si, 'DoIP');
+            case 8: return has(si, 'UDS');
+            case 9: return si.transport === 'CAN';
             default: return true;
         }
     };
@@ -537,6 +555,17 @@ $('btnExportCsv').addEventListener('click', async () => {
         const r = await postJSON('/api/export/csv', { path });
         setStatus('已导出 CSV: ' + r.path);
     } catch (e) { setStatus('导出失败：' + e.message); }
+});
+
+// ---------- 保存 PCAP ----------
+$('btnExportPcap').addEventListener('click', async () => {
+    const path = $('pcapSavePath').value.trim();
+    if (!path) { setStatus('请输入 PCAP 保存路径'); return; }
+    setStatus('保存 PCAP 中...');
+    try {
+        const r = await postJSON('/api/export/pcap', { path });
+        setStatus('已保存 PCAP: ' + r.path);
+    } catch (e) { setStatus('保存失败：' + e.message); }
 });
 
 // ---------- 分页 Tab 切换 ----------

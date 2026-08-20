@@ -13,7 +13,6 @@
 
 namespace
 {
-// 写经典小端 pcap 全局头
 void writePcapGlobalHeader(FILE* f)
 {
     // magic d4c3b2a1 + 2.4 + thiszone 0 + sigfigs 0 + snaplen 65535 + network 1(Ethernet)
@@ -157,6 +156,8 @@ void NativeCapture::workThread(std::string adapterName, PacketCallback onPacket,
           captureFile.c_str(), dl);
     auto   startTime = std::chrono::steady_clock::now();
     int    frame     = 1;
+    // 跨包保留状态：实时抓包场景下同一 CAN 总线的多帧 UDS 报文也需要按到达顺序重组。
+    NativePacketParser::IsoTpReassembler isoTp;
     while (!stopFlag_)
     {
         // 时长限制：到点退出（等价 tshark -a duration:N）
@@ -180,9 +181,9 @@ void NativeCapture::workThread(std::string adapterName, PacketCallback onPacket,
                              static_cast<double>(hdr->ts.tv_usec) / 1e6;
             p.cap_len = hdr->caplen;
             p.len     = hdr->len;
-            NativePacketParser::parseFrame(data, hdr->caplen, p, linkType);
+            NativePacketParser::parseFrame(data, hdr->caplen, p, linkType, &isoTp);
             if (onPacket)
-                onPacket(std::make_shared<Packet>(p));
+                onPacket(std::make_shared<Packet>(std::move(p)));
         }
         else if (rc == -1)
         {
